@@ -2,11 +2,31 @@
 """
 IP Address Validator
 Validates both IPv4 and IPv6 addresses
+
+Overview of modules used
+-------------------------
+re           – regular-expression engine; used for the regex-based IPv4 validator
+ipaddress    – stdlib module that parses, validates, and classifies IP addresses
+               and networks for both IPv4 and IPv6
+json         – decodes JSON responses returned by the external REST APIs
+socket       – provides gethostbyaddr() for reverse DNS (PTR record) lookups
+urllib       – stdlib HTTP client used to call RDAP and threat-intel APIs
+               without requiring any third-party packages
 """
 
 import re
 import ipaddress
+import json
+import socket
+import urllib.request
+import urllib.error
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BASIC VALIDATION HELPERS
+# These three functions provide low-level building blocks used by the higher-
+# level parse_network_input() and get_ip_info() functions further below.
+# ─────────────────────────────────────────────────────────────────────────────
 
 def validate_ip_basic(ip_string):
     """
@@ -18,6 +38,8 @@ def validate_ip_basic(ip_string):
     Returns:
         tuple: (is_valid, ip_type, ip_object)
     """
+    # ipaddress.ip_address() raises ValueError for any string that is not a
+    # well-formed IPv4 or IPv6 address, so we catch that and return False.
     try:
         ip_obj = ipaddress.ip_address(ip_string)
         if isinstance(ip_obj, ipaddress.IPv4Address):
@@ -32,6 +54,10 @@ def get_default_prefix(ip_obj):
     """
     Return the default host prefix when no CIDR is provided.
     IPv4 defaults to /32 and IPv6 defaults to /128.
+
+    A /32 (IPv4) or /128 (IPv6) represents a single host — i.e., no subnet at
+    all.  This is used when the user types a bare address like "8.8.8.8"
+    instead of "8.8.8.8/24".
     """
     return 32 if isinstance(ip_obj, ipaddress.IPv4Address) else 128
 
@@ -39,6 +65,16 @@ def get_default_prefix(ip_obj):
 def get_ipv4_class(ip_obj):
     """
     Return the classful IPv4 subnet class based on the first octet.
+
+    Classful addressing is a legacy concept (superseded by CIDR in 1993) but
+    is still commonly referenced.  The class is determined entirely by the
+    value of the first octet:
+        1–126   → Class A  (large networks, /8 default mask)
+        127     → Class A Loopback
+        128–191 → Class B  (medium networks, /16 default mask)
+        192–223 → Class C  (small networks, /24 default mask)
+        224–239 → Class D  (multicast, not assigned to hosts)
+        240–255 → Class E  (experimental/reserved)
     """
     first_octet = int(str(ip_obj).split('.')[0])
 
@@ -55,6 +91,13 @@ def get_ipv4_class(ip_obj):
     return "Class E (Experimental)"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# INPUT PARSING
+# Accepts a bare address ("1.2.3.4") or a CIDR-notated network ("1.2.3.4/24").
+# Returns both the host address object and the network object so callers can
+# derive subnet mask, network address, broadcast, and host range from one call.
+# ─────────────────────────────────────────────────────────────────────────────
+
 def parse_network_input(ip_string):
     """
     Parse an IP address with optional CIDR notation.
@@ -68,9 +111,14 @@ def parse_network_input(ip_string):
 
     try:
         if '/' in candidate:
+            # CIDR notation supplied — parse the network (strict=False allows
+            # host bits to be set, e.g. "192.168.1.5/24" is accepted).
             network_obj = ipaddress.ip_network(candidate, strict=False)
+            # Also parse just the host address portion (left of the slash) so
+            # we can inspect its individual flags (is_private, is_loopback…).
             ip_obj = ipaddress.ip_address(candidate.split('/')[0])
         else:
+            # No CIDR — treat as a single host and synthesise a /32 or /128.
             ip_obj = ipaddress.ip_address(candidate)
             network_obj = ipaddress.ip_network(
                 f"{ip_obj}/{get_default_prefix(ip_obj)}",
@@ -83,6 +131,13 @@ def parse_network_input(ip_string):
         return (False, None, None, None)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ALTERNATIVE VALIDATORS (IPv4 only)
+# These two functions demonstrate different techniques for validating an IPv4
+# address string.  They are not called by the main pipeline (which uses
+# parse_network_input instead) but are kept here as reference implementations.
+# ─────────────────────────────────────────────────────────────────────────────
+
 def validate_ipv4_regex(ip_string):
     """
     Validate IPv4 address using regex pattern
@@ -93,6 +148,11 @@ def validate_ipv4_regex(ip_string):
     Returns:
         bool: True if valid IPv4, False otherwise
     """
+    # The pattern matches exactly four dot-separated octets, each in 0–255.
+    # It uses three alternations per octet to cover the full range precisely:
+    #   25[0-5]        → 250–255
+    #   2[0-4][0-9]    → 200–249
+    #   [01]?[0-9][0-9]? → 0–199 (with optional leading digit)
     # Pattern for IPv4: 0-255.0-255.0-255.0-255
     pattern = r'^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$'
     return bool(re.match(pattern, ip_string))
@@ -121,12 +181,20 @@ def validate_ipv4_manual(ip_string):
             if num < 0 or num > 255:
                 return False
             # Check for leading zeros (e.g., "192.168.01.1" is invalid)
+            # Python's int() would silently strip them, so we check the raw string.
             if len(part) > 1 and part[0] == '0':
                 return False
         except ValueError:
             return False
     
     return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IPV4 → IPV6 CONVERSION HELPERS
+# These produce the two most common ways an IPv4 address appears in IPv6
+# contexts.  Both are informational only — not used for routing decisions.
+# ─────────────────────────────────────────────────────────────────────────────
 
 def ipv4_to_ipv6_mapped(ipv4_obj):
     """
@@ -138,7 +206,13 @@ def ipv4_to_ipv6_mapped(ipv4_obj):
         
     Returns:
         str: IPv6-mapped address
+
+    IPv4-mapped addresses (::ffff:0:0/96) are used by dual-stack systems to
+    represent an IPv4 address in an IPv6 socket API, e.g. when a server
+    listening on an IPv6 socket receives a connection from an IPv4 client.
     """
+    # Prepend the well-known ::ffff: prefix and let the ipaddress module
+    # normalise the result into compact colon-hex notation.
     # Convert IPv4 to IPv6-mapped format (::ffff:x.x.x.x)
     ipv6_mapped = ipaddress.IPv6Address('::ffff:' + str(ipv4_obj))
     return str(ipv6_mapped)
@@ -154,7 +228,14 @@ def ipv4_to_ipv6_6to4(ipv4_obj):
         
     Returns:
         str: 6to4 IPv6 address
+
+    6to4 (RFC 3056) was a transition mechanism that let IPv6 traffic travel
+    over an IPv4 network without explicit tunnels.  The IPv4 address is encoded
+    directly in the IPv6 prefix, making the mapping deterministic.
     """
+    # Split the IPv4 address into its four integer octets, convert each to a
+    # two-digit hex string, then pair them as the two 16-bit groups required by
+    # the 2002::/16 prefix.
     # Convert IPv4 octets to hex
     octets = [int(x) for x in str(ipv4_obj).split('.')]
     hex_addr = ''.join(f'{octet:02x}' for octet in octets)
@@ -163,6 +244,417 @@ def ipv4_to_ipv6_6to4(ipv4_obj):
     return ipv6_6to4
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# REVERSE DNS LOOKUP
+# Queries the system's DNS resolver for a PTR record associated with the IP.
+# Works for any valid address — loopback, private, and public alike.
+# No external service or API key is needed; the OS resolver is used directly.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def reverse_dns_lookup(ip_obj):
+    """
+    Perform a reverse DNS (PTR record) lookup for an IP address.
+
+    Uses socket.gethostbyaddr(), which queries the system resolver — the same
+    DNS infrastructure used by dig/nslookup.  Works for both IPv4 and IPv6.
+
+    Args:
+        ip_obj: IPv4Address or IPv6Address object
+
+    Returns:
+        list[str]: One or more hostnames associated with the address, or an
+        empty list if no PTR record exists or the lookup times out.
+    """
+    try:
+        hostname, aliases, _ = socket.gethostbyaddr(str(ip_obj))
+        # Deduplicate while preserving order; primary hostname first.
+        # Filter out raw arpa PTR names (e.g. "8.8.8.8.in-addr.arpa") — callers
+        # want human-readable FQDNs, not the PTR query form itself.
+        seen = set()
+        results = []
+        for name in [hostname] + aliases:
+            if name not in seen and not name.endswith(".arpa"):
+                seen.add(name)
+                results.append(name)
+        return results
+    except (socket.herror, socket.gaierror, OSError):
+        # herror  → host not found / no PTR record
+        # gaierror → network unreachable or resolver error
+        # OSError  → catch-all for unexpected socket failures
+        return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RDAP / REGISTRATION LOOKUP
+# RDAP (Registration Data Access Protocol) is the modern, JSON-based successor
+# to WHOIS.  It tells us which organisation owns a given IP block and what that
+# block's registered CIDR range is.
+#
+# We use ARIN's bootstrap endpoint because it automatically issues an HTTP
+# 3xx redirect to the correct Regional Internet Registry (RIR) for any IP:
+#   ARIN   → North America
+#   RIPE   → Europe / Middle East / Central Asia
+#   APNIC  → Asia-Pacific
+#   LACNIC → Latin America
+#   AFRINIC → Africa
+#
+# No API key is required.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def lookup_rdap(ip_obj):
+    """
+    Look up the registered owner of a publicly routable IP address using RDAP
+    (Registration Data Access Protocol), the modern JSON-based successor to WHOIS.
+
+    Uses ARIN's bootstrap endpoint (https://rdap.arin.net/registry/ip/<address>)
+    which automatically follows 3xx redirects to the correct Regional Internet
+    Registry (RIPE, APNIC, LACNIC, AFRINIC) for non-ARIN addresses.
+    No API key is required.
+
+    Args:
+        ip_obj: IPv4Address or IPv6Address object
+
+    Returns:
+        dict with keys 'org', 'network_name', 'cidr_block' on success,
+        or None if the lookup fails.
+    """
+    url = f"https://rdap.arin.net/registry/ip/{ip_obj}"
+    try:
+        req = urllib.request.Request(
+            url, headers={"Accept": "application/rdap+json"}
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode())
+
+        # The 'name' field is the short network/registry name (e.g. "GOGL")
+        network_name = data.get("name", "")
+
+        # Build a CIDR string from the cidr0_cidrs extension when present,
+        # otherwise fall back to startAddress/endAddress range.
+        # cidr0_cidrs is an ARIN extension that lists the exact CIDR blocks
+        # rather than just a start/end address pair — more precise and useful.
+        cidrs = data.get("cidr0_cidrs", [])
+        if cidrs:
+            # IPv6 uses "v6prefix"; IPv4 uses "v4prefix"
+            prefix_key = "v6prefix" if isinstance(ip_obj, ipaddress.IPv6Address) else "v4prefix"
+            cidr_block = ", ".join(
+                f"{c[prefix_key]}/{c['length']}" for c in cidrs if prefix_key in c
+            )
+        else:
+            # Fallback: express the allocation as a start–end range
+            start = data.get("startAddress", "")
+            end = data.get("endAddress", "")
+            cidr_block = f"{start} - {end}" if start else ""
+
+        # Walk the 'entities' list for the registrant organisation name.
+        # The RDAP entities array contains contacts with assigned roles.
+        # We prefer 'registrant' (the IP block owner) over 'administrative'.
+        # Each entity's name lives inside a vCard array under the "fn" property.
+        org = ""
+        for role_pref in ("registrant", "administrative"):
+            for entity in data.get("entities", []):
+                if role_pref not in entity.get("roles", []):
+                    continue
+                vcard = entity.get("vcardArray", [])
+                # vcardArray structure: ["vcard", [[prop, params, type, value], ...]]
+                if len(vcard) >= 2:
+                    for prop in vcard[1]:
+                        if prop[0] == "fn":   # "fn" is the formatted name property
+                            org = prop[3]
+                            break
+                if org:
+                    break
+            if org:
+                break
+
+        return {
+            "org": org or network_name,   # fall back to short name if no vCard
+            "network_name": network_name,
+            "cidr_block": cidr_block,
+        }
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, KeyError):
+        # Any network or parse error is treated as a graceful miss — the caller
+        # receives None and simply skips the RDAP section in the output table.
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# THREAT INTELLIGENCE LOOKUP
+# Queries two free, keyless public APIs to surface threat signals for public
+# IP addresses.  Results are merged into a single dict so the caller only needs
+# to check one place regardless of which services responded.
+#
+# Sources:
+#   1. ip-api.com  — proxy/VPN/hosting flags, ISP, ASN, geo  (IPv4 only)
+#   2. StopForumSpam — crowdsourced abuse/spam reports, Tor exit flag
+#
+# Both services are free with no registration required.  All network errors
+# are silently swallowed; the function returns None if both calls fail so the
+# caller can safely skip the threat section in the output.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def lookup_threat_intel(ip_obj):
+    """
+    Check a publicly routable IP against two free, keyless threat-intelligence
+    services and return a consolidated threat summary.
+
+    Sources
+    -------
+    1. ip-api.com  (http://ip-api.com/json/<ip>)
+       Returns proxy/VPN/hosting/mobile flags, ISP, ASN, and geolocation.
+       Free tier; no API key required.  IPv4 only.
+
+    2. StopForumSpam  (https://api.stopforumspam.org/api?ip=<ip>&json)
+       Crowdsourced database of IPs seen in forum spam, brute-force attacks,
+       and similar abuse.  Returns appearance count, confidence score (0–100),
+       and a Tor-exit flag.  No API key required.
+
+    Args:
+        ip_obj: IPv4Address or IPv6Address object
+
+    Returns:
+        dict with the following keys (all may be None/empty if unavailable):
+            is_proxy    (bool)   – flagged as proxy or VPN by ip-api
+            is_hosting  (bool)   – flagged as datacenter/hosting by ip-api
+            is_tor      (bool)   – confirmed Tor exit node (either source)
+            isp         (str)    – ISP name from ip-api
+            asn         (str)    – AS number + name from ip-api
+            geo         (str)    – "City, Region, Country" from ip-api
+            abuse_score (float)  – StopForumSpam confidence score (0–100)
+            abuse_freq  (int)    – number of times seen in abuse reports
+            abuse_last  (str)    – date last seen in abuse reports
+            flags       (list)   – human-readable threat tags e.g. ["Proxy/VPN", "Tor exit"]
+        or None if both lookups fail.
+    """
+    # Initialise the result dict with safe defaults so that partial responses
+    # (only one of the two APIs succeeds) still produce a usable output dict.
+    result = {
+        "is_proxy":    None,
+        "is_hosting":  None,
+        "is_tor":      False,
+        "isp":         "",
+        "asn":         "",
+        "geo":         "",
+        "abuse_score": None,
+        "abuse_freq":  None,
+        "abuse_last":  "",
+        "flags":       [],
+    }
+    # Track whether at least one API call succeeded so we can return None
+    # instead of an empty dict when both sources are unreachable.
+    any_success = False
+
+    # ── 1. ip-api.com ── IPv4 only; silently skip for IPv6
+    # ip-api.com does not support IPv6 on its free tier, so we guard here
+    # to avoid a guaranteed failure for IPv6 addresses.
+    if isinstance(ip_obj, ipaddress.IPv4Address):
+        # Request only the fields we actually use to keep the response small.
+        fields = "status,country,regionName,city,isp,org,as,proxy,hosting,mobile,query"
+        try:
+            req = urllib.request.Request(
+                f"http://ip-api.com/json/{ip_obj}?fields={fields}",
+                headers={"Accept": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                d = json.loads(resp.read().decode())
+            if d.get("status") == "success":
+                any_success = True
+                result["is_proxy"]   = d.get("proxy", False)
+                result["is_hosting"] = d.get("hosting", False)
+                result["isp"]        = d.get("isp", "")
+                result["asn"]        = d.get("as", "")
+                # Build a single human-readable geo string from the three parts,
+                # omitting any that are empty (some IPs have no city/region).
+                city    = d.get("city", "")
+                region  = d.get("regionName", "")
+                country = d.get("country", "")
+                result["geo"] = ", ".join(p for p in [city, region, country] if p)
+                # Populate the flags list with human-readable labels for any
+                # signals that are active on this address.
+                if result["is_proxy"]:
+                    result["flags"].append("Proxy / VPN")
+                if result["is_hosting"]:
+                    result["flags"].append("Hosting / datacenter")
+                if d.get("mobile"):
+                    result["flags"].append("Mobile network")
+        except (urllib.error.URLError, OSError, json.JSONDecodeError):
+            pass   # network error — continue to next source
+
+    # ── 2. StopForumSpam ──
+    # StopForumSpam maintains a crowdsourced list of IPs reported for spam,
+    # brute-force login attempts, and similar abuse.  It also flags known Tor
+    # exit nodes.  The confidence score (0–100) reflects how reliably an IP
+    # has been associated with abuse; we only flag it if >= 25 to reduce noise.
+    try:
+        req = urllib.request.Request(
+            f"https://api.stopforumspam.org/api?ip={ip_obj}&json",
+            headers={"Accept": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            d = json.loads(resp.read().decode())
+        ip_data = d.get("ip", {})
+        if d.get("success") and ip_data:
+            any_success = True
+            result["abuse_score"] = ip_data.get("confidence")
+            result["abuse_freq"]  = ip_data.get("frequency", 0)
+            result["abuse_last"]  = ip_data.get("lastseen", "")
+            # torexit=1 in the response means StopForumSpam has independently
+            # confirmed this as a Tor exit node (cross-checked against the
+            # official Tor exit list).
+            if ip_data.get("torexit"):
+                result["is_tor"] = True
+                if "Tor exit node" not in result["flags"]:
+                    result["flags"].append("Tor exit node")
+            # Only add the abuse flag if the IP has actually appeared in reports
+            # AND the confidence score is high enough to be meaningful.
+            if ip_data.get("appears") and ip_data.get("confidence", 0) >= 25:
+                tag = f"Abuse reports (confidence {ip_data['confidence']:.0f}%)"
+                result["flags"].append(tag)
+    except (urllib.error.URLError, OSError, json.JSONDecodeError):
+        pass   # network error — result dict already has safe defaults
+
+    # Return None if every API call failed so the caller can skip the section.
+    return result if any_success else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WELL-KNOWN ADDRESS COMMENT LOOKUP
+# Maps an IP address to a plain-English description of its reserved or special
+# purpose.  Checks are ordered most-specific → most-general so that, for
+# example, 127.0.0.1 is caught by the loopback check before falling through
+# to any broader range check.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_ip_comment(ip_obj, ip_type):
+    """
+    Return a human-readable comment describing the well-known role of an IP address.
+
+    Checks are ordered from most-specific to most-general so that, for example,
+    127.0.0.1 is identified as loopback before it would match anything else.
+
+    Args:
+        ip_obj:  IPv4Address or IPv6Address object
+        ip_type: "IPv4" or "IPv6"
+
+    Returns:
+        str: Descriptive comment, or empty string for ordinary public addresses.
+    """
+    # ----- Loopback -----
+    # The is_loopback property covers the entire 127.0.0.0/8 range for IPv4
+    # and ::1 for IPv6, so we check it first before any range comparisons.
+    if ip_obj.is_loopback:
+        if ip_type == "IPv4":
+            return "Loopback address (127.0.0.0/8) — used to refer to the local host itself"
+        return "IPv6 loopback address (::1) — equivalent to IPv4 127.0.0.1"
+
+    # ----- Unspecified / all-zeros -----
+    # 0.0.0.0 and :: mean "any local interface" in socket APIs and are used
+    # as a placeholder source address before a real address is assigned (DHCP).
+    if ip_obj == ipaddress.ip_address("0.0.0.0") or ip_obj == ipaddress.ip_address("::"):
+        return "Unspecified address — represents 'any' interface; not routable"
+
+    # ----- IPv4-specific well-known ranges -----
+    # Each check uses the 'in network' membership test which is O(1) and
+    # avoids string manipulation on every comparison.
+    if ip_type == "IPv4":
+        ip4 = ipaddress.IPv4Address(ip_obj)
+
+        # RFC 1918 private ranges — the three blocks reserved for private
+        # networks that must not be routed on the public internet.
+        if ip4 in ipaddress.IPv4Network("10.0.0.0/8"):
+            return "RFC 1918 private address (10.0.0.0/8) — Class A private range, not routable on the public internet"
+
+        if ip4 in ipaddress.IPv4Network("172.16.0.0/12"):
+            return "RFC 1918 private address (172.16.0.0/12) — Class B private range, not routable on the public internet"
+
+        if ip4 in ipaddress.IPv4Network("192.168.0.0/16"):
+            return "RFC 1918 private address (192.168.0.0/16) — Class C private range, commonly used in home and office networks"
+
+        # Link-local (APIPA) — auto-assigned by the OS when DHCP fails
+        if ip4 in ipaddress.IPv4Network("169.254.0.0/16"):
+            return "Link-local address (169.254.0.0/16, RFC 3927) — auto-assigned when no DHCP server is reachable; not routable beyond the local link"
+
+        # Carrier-grade NAT shared space — used by ISPs for NAT444 deployments
+        if ip4 in ipaddress.IPv4Network("100.64.0.0/10"):
+            return "Shared address space (100.64.0.0/10, RFC 6598) — used by ISPs for carrier-grade NAT; not routable on the public internet"
+
+        # TEST-NET documentation ranges — must never appear on a live network
+        if ip4 in ipaddress.IPv4Network("192.0.2.0/24"):
+            return "Documentation / example address (192.0.2.0/24, RFC 5737) — TEST-NET-1, for use in documentation and examples only"
+
+        if ip4 in ipaddress.IPv4Network("198.51.100.0/24"):
+            return "Documentation / example address (198.51.100.0/24, RFC 5737) — TEST-NET-2, for use in documentation and examples only"
+
+        if ip4 in ipaddress.IPv4Network("203.0.113.0/24"):
+            return "Documentation / example address (203.0.113.0/24, RFC 5737) — TEST-NET-3, for use in documentation and examples only"
+
+        # Multicast — not assigned to individual hosts; used for group traffic
+        if ip4 in ipaddress.IPv4Network("224.0.0.0/4"):
+            return "Multicast address (224.0.0.0/4, RFC 5771) — used for one-to-many group communication, not a host address"
+
+        # Class E reserved/experimental — never deployed in practice
+        if ip4 in ipaddress.IPv4Network("240.0.0.0/4"):
+            return "Reserved / experimental address (240.0.0.0/4, RFC 1112) — Class E range; not used in practice"
+
+        # Limited broadcast — delivered to all hosts on the local segment only
+        if ip4 == ipaddress.IPv4Address("255.255.255.255"):
+            return "Limited broadcast address — sent to all hosts on the local network segment"
+
+        # Legacy 6to4 anycast relay — the rendezvous point for 6to4 tunnels
+        if ip4 in ipaddress.IPv4Network("192.88.99.0/24"):
+            return "6to4 anycast relay address (192.88.99.0/24, RFC 7526) — formerly used for IPv6-over-IPv4 tunnelling"
+
+        # Ordinary public address — none of the special ranges matched
+        return "Public / globally routable IPv4 address"
+
+    # ----- IPv6-specific well-known ranges -----
+    ip6 = ipaddress.IPv6Address(ip_obj)
+
+    # Unique local (fc00::/7) — the IPv6 equivalent of RFC 1918 private space
+    if ip6 in ipaddress.IPv6Network("fc00::/7"):
+        return "Unique local address (fc00::/7, RFC 4193) — IPv6 equivalent of RFC 1918 private space; not routable on the public internet"
+
+    # Link-local (fe80::/10) — auto-configured on every IPv6 interface
+    if ip6 in ipaddress.IPv6Network("fe80::/10"):
+        return "Link-local address (fe80::/10, RFC 4291) — auto-configured on every IPv6 interface; only valid on the local link"
+
+    # IPv4-mapped (::ffff:0:0/96) — IPv4 address expressed in IPv6 form
+    if ip6 in ipaddress.IPv6Network("::ffff:0:0/96"):
+        return "IPv4-mapped IPv6 address (::ffff:0:0/96, RFC 4291) — represents an IPv4 address in IPv6 notation"
+
+    # 6to4 (2002::/16) — transition mechanism embedding an IPv4 address
+    if ip6 in ipaddress.IPv6Network("2002::/16"):
+        return "6to4 address (2002::/16, RFC 3056) — embeds an IPv4 address for IPv6-over-IPv4 tunnelling"
+
+    # Documentation range — like 192.0.2.0/24 but for IPv6
+    if ip6 in ipaddress.IPv6Network("2001:db8::/32"):
+        return "Documentation / example address (2001:db8::/32, RFC 3849) — for use in documentation and examples only"
+
+    # IPv6 multicast (ff00::/8) — group communication, not a host address
+    if ip6 in ipaddress.IPv6Network("ff00::/8"):
+        return "IPv6 multicast address (ff00::/8, RFC 4291) — used for one-to-many group communication"
+
+    # Teredo (2001::/32) — tunnels IPv6 through IPv4 NAT via UDP
+    if ip6 in ipaddress.IPv6Network("2001::/32"):
+        return "Teredo tunnelling address (2001::/32, RFC 4380) — encapsulates IPv6 packets within IPv4 UDP"
+
+    # NAT64 (64:ff9b::/96) — maps IPv4 addresses for IPv6-only clients
+    if ip6 in ipaddress.IPv6Network("64:ff9b::/96"):
+        return "IPv4/IPv6 translation address (64:ff9b::/96, RFC 6052) — used by NAT64 gateways"
+
+    return "Public / globally routable IPv6 address"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN INFO AGGREGATOR
+# get_ip_info() is the single entry point that callers should use.  It:
+#   1. Parses and validates the input (bare address or CIDR)
+#   2. Computes subnet geometry (mask, range, host count, class)
+#   3. Derives IPv6 representations for IPv4 addresses
+#   4. Runs the reverse DNS lookup (all addresses)
+#   5. Runs RDAP and threat-intel lookups (public addresses only)
+# and returns everything as a flat dict.
+# ─────────────────────────────────────────────────────────────────────────────
 
 def get_ip_info(ip_string):
     """
@@ -176,6 +668,9 @@ def get_ip_info(ip_string):
     """
     is_valid, ip_type, ip_obj, network_obj = parse_network_input(ip_string)
     
+    # If the input could not be parsed as any valid IP address or CIDR,
+    # return a minimal dict with valid=False so the caller can handle it
+    # gracefully without needing to catch an exception.
     if not is_valid:
         return {
             "valid": False,
@@ -195,6 +690,10 @@ def get_ip_info(ip_string):
 
     assert ip_obj is not None and network_obj is not None
 
+    # ── Subnet geometry ──────────────────────────────────────────────────────
+    # IPv4 and IPv6 are handled separately because classful naming only applies
+    # to IPv4, and host count rules differ (IPv6 does not reserve network/
+    # broadcast addresses from the usable count).
     # Calculate host count
     # For IPv4: total addresses minus network and broadcast (except /31 and /32)
     # For IPv6: all addresses are usable
@@ -203,23 +702,32 @@ def get_ip_info(ip_string):
         subnet_mask = str(network_obj.netmask)
         
         if network_obj.prefixlen == 32:
+            # /32 = single host — network address and broadcast are the same address
             # Single host
             host_count = 1
             ip_range = f"{network_obj.network_address} - {network_obj.broadcast_address}"
         elif network_obj.prefixlen == 31:
+            # /31 point-to-point links (RFC 3021) treat both addresses as usable
+            # hosts; there is no separate network or broadcast address.
             # Point-to-point link (RFC 3021) - both addresses usable
             host_count = 2
             ip_range = f"{network_obj.network_address} - {network_obj.broadcast_address}"
         else:
+            # Standard subnets reserve the first address (network) and the last
+            # (broadcast), so usable host count = total - 2.
             # Standard subnet: total - network - broadcast
             host_count = network_obj.num_addresses - 2
             ip_range = f"{network_obj.network_address + 1} - {network_obj.broadcast_address - 1}"
     else:
+        # IPv6 has no concept of broadcast; every address in the prefix is usable.
         subnet_class = "N/A"
         subnet_mask = str(network_obj.netmask)
         host_count = network_obj.num_addresses
         ip_range = f"{network_obj.network_address} - {network_obj.broadcast_address}"
 
+    # ── IPv6 representations of this IPv4 address ────────────────────────────
+    # Compute both the IPv4-mapped and 6to4 forms so the output table can show
+    # how this address would appear in mixed IPv4/IPv6 environments.
     # Add IPv6 conversion info for IPv4 addresses
     ipv6_mapped = None
     ipv6_6to4 = None
@@ -227,7 +735,12 @@ def get_ip_info(ip_string):
         ipv6_mapped = ipv4_to_ipv6_mapped(ip_obj)
         ipv6_6to4 = ipv4_to_ipv6_6to4(ip_obj)
     
-    return {
+    # ── Assemble the result dict ──────────────────────────────────────────────
+    # Reverse DNS is run for all addresses (PTR records exist for private and
+    # loopback ranges too).  RDAP and threat-intel are deferred until after the
+    # is_public check below, since calling those APIs for 192.168.x.x would
+    # waste a round-trip and return no useful data.
+    result = {
         "valid": True,
         "ip": str(ip_obj),
         "type": ip_type,
@@ -243,15 +756,215 @@ def get_ip_info(ip_string):
         "ip_range": ip_range,
         "host_count": host_count,
         "ipv6_mapped": ipv6_mapped,
-        "ipv6_6to4": ipv6_6to4
+        "ipv6_6to4": ipv6_6to4,
+        "comment": get_ip_comment(ip_obj, ip_type),
+        "reverse_dns": reverse_dns_lookup(ip_obj),
+        "rdap": None,           # populated below for public addresses
+        "threat_intel": None,   # populated below for public addresses
     }
 
+    # ── Network lookups (public addresses only) ───────────────────────────────
+    # We only call RDAP and threat-intel APIs when the address is actually
+    # reachable on the public internet.  Private, loopback, multicast, reserved,
+    # and unspecified addresses are all excluded so we don't waste network
+    # round-trips and don't mislead the user with "no data" for RFC 1918 IPs.
+    # Only hit the network for addresses that are actually globally routable
+    is_public = (
+        not ip_obj.is_private
+        and not ip_obj.is_loopback
+        and not ip_obj.is_multicast
+        and not ip_obj.is_reserved
+        and not ip_obj.is_unspecified
+    )
+    if is_public:
+        result["rdap"] = lookup_rdap(ip_obj)
+        result["threat_intel"] = lookup_threat_intel(ip_obj)
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TABLE RENDERER
+# print_ip_table() takes the dict produced by get_ip_info() and renders it as
+# a formatted two-column ASCII box table.  All presentation logic lives here so
+# the data functions above stay clean and testable without side effects.
+#
+# Column widths are defined as constants (COL1, COL2) at the top of the
+# function.  Three inner helpers handle the three types of output row:
+#   row()     — a standard label/value pair (with value word-wrapping)
+#   section() — a full-width section header that spans both columns
+#   divider() — a horizontal rule between groups of related rows
+# ─────────────────────────────────────────────────────────────────────────────
+
+def print_ip_table(info):
+    """
+    Print a formatted two-column table for the result of get_ip_info().
+
+    Layout
+    ------
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │  IP Address Report: <ip>                                            │
+    ├──────────────────────┬──────────────────────────────────────────────┤
+    │  Label               │  Value                                       │
+    │  ...                 │  ...                                         │
+    ├──────────────────────┴──────────────────────────────────────────────┤
+    │  Section header                                                     │
+    ├──────────────────────┬──────────────────────────────────────────────┤
+    │  ...                 │  ...                                         │
+    └──────────────────────┴──────────────────────────────────────────────┘
+
+    Long values are word-wrapped to fit inside the right column.
+    """
+    COL1 = 22   # width of the label column (including one padding space each side)
+    COL2 = 48   # width of the value column (including one padding space each side)
+    TOTAL = COL1 + COL2 + 3  # 3 = left border + separator + right border
+
+    def _wrap(text, width):
+        """Split text into lines of at most `width` characters."""
+        # Word-wrap by accumulating words onto the current line until the next
+        # word would overflow, then start a new line.
+        words, lines, current = text.split(), [], ""
+        for word in words:
+            if current and len(current) + 1 + len(word) > width:
+                lines.append(current)
+                current = word
+            else:
+                current = (current + " " + word).strip()
+        if current:
+            lines.append(current)
+        return lines or [""]
+
+    def row(label, value):
+        """Print a single data row, wrapping the value if necessary."""
+        inner1 = COL1 - 2   # usable chars inside padding
+        inner2 = COL2 - 2
+        # Truncate labels that are too long (shouldn't happen in practice)
+        # and left-pad the value column.
+        label_str = str(label)[:inner1].ljust(inner1)
+        value_lines = _wrap(str(value), inner2)
+        # Print the first line with its label; continuation lines get a blank label.
+        print(f"│ {label_str} │ {value_lines[0].ljust(inner2)} │")
+        for extra in value_lines[1:]:
+            print(f"│ {''.ljust(inner1)} │ {extra.ljust(inner2)} │")
+
+    def section(title):
+        """Print a full-width section divider row."""
+        # The section header spans the full table width by temporarily merging
+        # the two columns: the ┴ and ┬ separators are replaced with a plain ─.
+        inner = TOTAL - 4   # 4 = '│ ' + ' │'
+        print(f"├─{'─' * (COL1 - 2)}─┴─{'─' * (COL2 - 2)}─┤")
+        print(f"│ {title.ljust(inner)} │")
+        print(f"├─{'─' * (COL1 - 2)}─┬─{'─' * (COL2 - 2)}─┤")
+
+    def divider():
+        # A horizontal rule using ├, ┤, and ─ characters to visually separate
+        # groups of related rows within the same section.
+        print(f"├─{'─' * (COL1 - 2)}─┬─{'─' * (COL2 - 2)}─┤")
+
+    # ── top border + title ───────────────────────────────────────────────
+    # The title row spans the full table width like a section header, but uses
+    # the outer ┌/┐ corners because it is the very first row.
+    title = f"  IP Address Report: {info['ip']}"
+    print(f"┌─{'─' * (TOTAL - 2)}─┐")
+    print(f"│{title:<{TOTAL}}│")
+    print(f"├─{'─' * (COL1 - 2)}─┬─{'─' * (COL2 - 2)}─┤")
+
+    # Short-circuit for invalid addresses — just show the error and close.
+    if not info['valid']:
+        row("Valid", "✗  Invalid IP address")
+        print(f"└─{'─' * (COL1 - 2)}─┴─{'─' * (COL2 - 2)}─┘")
+        return
+
+    # ── core fields ──────────────────────────────────────────────────────
+    # These fields are always present for a valid address.
+    row("Valid",           "✓  " + info['type'] + " address")
+    row("CIDR",            info['cidr'])
+    row("Subnet Mask",     info['subnet_mask'])
+    row("Subnet Class",    info['subnet_class'])
+    row("Network Address", info['network_address'])
+    row("IP Range",        info['ip_range'])
+    row("Host Count",      f"{info['host_count']:,}")
+    # ── address-type flags ────────────────────────────────────────────────
+    divider()
+    row("Private",         info['is_private'])
+    row("Loopback",        info['is_loopback'])
+    row("Multicast",       info['is_multicast'])
+    row("Reserved",        info['is_reserved'])
+    # ── well-known address note (conditional) ─────────────────────────────
+    # Only shown when the address falls in a named/special range.
+    if info['comment']:
+        divider()
+        row("Note", info['comment'])
+    # ── reverse DNS (conditional) ─────────────────────────────────────────
+    # Multiple hostnames are listed on separate rows under the same label.
+    if info['reverse_dns']:
+        divider()
+        for i, name in enumerate(info['reverse_dns']):
+            row("Reverse DNS" if i == 0 else "", name)
+    # ── IPv6 representations (conditional, IPv4 only) ─────────────────────
+    if info['ipv6_mapped']:
+        divider()
+        row("IPv6 Mapped",  info['ipv6_mapped'])
+        row("IPv6 6to4",    info['ipv6_6to4'])
+
+    # ── RDAP / registration ───────────────────────────────────────────────
+    # Only present for public addresses where the RDAP lookup succeeded.
+    if info.get('rdap'):
+        rdap = info['rdap']
+        section("RDAP / Registration (ARIN)")
+        row("Owner",            rdap['org'])
+        row("Network Name",     rdap['network_name'])
+        row("Registered Block", rdap['cidr_block'])
+
+    # ── Threat intelligence ───────────────────────────────────────────────
+    # Only present for public addresses where at least one threat API succeeded.
+    ti = info.get('threat_intel')
+    if ti:
+        section("Threat Intelligence")
+        if ti['geo']:
+            row("Geo",         ti['geo'])
+        if ti['isp']:
+            row("ISP",         ti['isp'])
+        if ti['asn']:
+            row("ASN",         ti['asn'])
+        row("Proxy / VPN",     "Yes" if ti['is_proxy']   else "No")
+        row("Hosting / DC",    "Yes" if ti['is_hosting'] else "No")
+        row("Tor Exit",        "Yes" if ti['is_tor']     else "No")
+        # Format the abuse report line differently depending on whether any
+        # reports exist: show count + confidence + date if yes, "None" if no.
+        if ti['abuse_freq'] is not None:
+            if ti['abuse_freq'] > 0:
+                abuse_str = (f"{ti['abuse_freq']} reports,"
+                             f" confidence {ti['abuse_score']:.0f}%,"
+                             f" last seen {ti['abuse_last']}")
+            else:
+                abuse_str = "None"
+            row("Abuse Reports", abuse_str)
+        if ti['flags']:
+            row("⚑  Flags", ", ".join(ti['flags']))
+        else:
+            row("⚑  Flags", "none")
+
+    # ── bottom border ─────────────────────────────────────────────────────
+    print(f"└─{'─' * (COL1 - 2)}─┴─{'─' * (COL2 - 2)}─┘")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENTRY POINT
+# main() runs in two phases:
+#   1. Batch mode  — loops over a hard-coded list of test IPs and prints a
+#                    table for each one so you can see the full range of output
+#                    formats (private, public, invalid, IPv6, etc.) at a glance.
+#   2. Interactive — prompts the user to enter addresses one at a time until
+#                    they type 'quit', 'exit', or 'q'.
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     """
     Main function to demonstrate IP validation
     """
-    # Test cases
+    # Test cases — one of each interesting category so the batch output
+    # exercises all code paths in print_ip_table().
     test_ips = [
         "192.168.1.1",          # Valid private IPv4, defaults to /32
         "8.8.8.8/24",           # Valid public IPv4 network
@@ -267,67 +980,38 @@ def main():
         "127.0.0.1",            # Valid IPv4 (loopback)
         "0.0.0.0",              # Valid IPv4 (all zeros)
     ]
-    
-    print("=" * 70)
-    print("IP ADDRESS VALIDATOR")
-    print("=" * 70)
-    
+
+    print("=" * 76)
+    print("  IP ADDRESS VALIDATOR")
+    print("=" * 76)
+
+    # Run each test case through the full pipeline and render its table.
     for ip in test_ips:
-        info = get_ip_info(ip)
-        print(f"\nIP: {ip}")
-        print(f"  Valid: {info['valid']}")
-        
-        if info['valid']:
-            print(f"  Type: {info['type']}")
-            print(f"  CIDR: {info['cidr']}")
-            print(f"  Host Count: {info['host_count']}")
-            print(f"  Subnet Class: {info['subnet_class']}")
-            print(f"  Subnet Mask: {info['subnet_mask']}")
-            print(f"  Network Address: {info['network_address']}")
-            print(f"  IP Range: {info['ip_range']}")
-            print(f"  Private: {info['is_private']}")
-            print(f"  Loopback: {info['is_loopback']}")
-            print(f"  Multicast: {info['is_multicast']}")
-            print(f"  Reserved: {info['is_reserved']}")
-            if info['ipv6_mapped']:
-                print(f"  IPv6 Mapped: {info['ipv6_mapped']}")
-                print(f"  IPv6 6to4: {info['ipv6_6to4']}")
-    
-    print("\n" + "=" * 70)
-    
-    # Interactive mode
+        print()
+        print_ip_table(get_ip_info(ip))
+
+    print()
+    print("=" * 76)
+
+    # Interactive mode — keep prompting until the user quits.
     print("\nInteractive Mode (type 'quit' to exit)")
-    print("\nThis tool takes an IP with or without a cidr mask and returns some info about it)")
-    print("-" * 70)
-    
+    print("This tool takes an IP with or without a CIDR mask and returns info about it.")
+    print("-" * 76)
+
     while True:
         user_input = input("\nEnter IP address or CIDR to validate: ").strip()
-        
+
+        # Accept several common quit commands so the tool feels natural.
         if user_input.lower() in ['quit', 'exit', 'q']:
             print("Goodbye!")
             break
-        
+
+        # Ignore blank lines so the user can press Enter without getting an error.
         if not user_input:
             continue
-        
-        info = get_ip_info(user_input)
-        
-        if info['valid']:
-            print(f"✓ Valid {info['type']} address")
-            print(f"  CIDR: {info['cidr']}")
-            print(f"  Host Count: {info['host_count']}")
-            print(f"  Subnet Class: {info['subnet_class']}")
-            print(f"  Subnet Mask: {info['subnet_mask']}")
-            print(f"  Network Address: {info['network_address']}")
-            print(f"  IP Range: {info['ip_range']}")
-            print(f"  Private: {info['is_private']}")
-            print(f"  Loopback: {info['is_loopback']}")
-            print(f"  Multicast: {info['is_multicast']}")
-            if info['ipv6_mapped']:
-                print(f"  IPv6 Mapped: {info['ipv6_mapped']}")
-                print(f"  IPv6 6to4: {info['ipv6_6to4']}")
-        else:
-            print("✗ Invalid IP address")
+
+        print()
+        print_ip_table(get_ip_info(user_input))
 
 
 if __name__ == "__main__":
