@@ -993,6 +993,14 @@ def main():
     print()
     print("=" * 76)
 
+    # Clear any history that leaked in from the shell / previous runs so the
+    # interactive session starts clean, but within-session recall still works.
+    try:
+        import readline
+        readline.clear_history()
+    except ImportError:
+        pass
+
     # Interactive mode — keep prompting until the user quits.
     print("\nInteractive Mode (type 'quit' to exit)")
     print("This tool takes an IP with or without a CIDR mask and returns info about it.")
