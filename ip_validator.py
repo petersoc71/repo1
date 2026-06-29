@@ -1,4 +1,4 @@
-qiot#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 IP Address Validator
 Validates both IPv4 and IPv6 addresses
