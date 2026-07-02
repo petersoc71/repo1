@@ -379,6 +379,67 @@ def lookup_rdap(ip_obj):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# DOMAIN REGISTRANT LOOKUP
+# When a reverse DNS hostname is available, we can look up who owns that domain
+# using RDAP for domains.  rdap.org is a public bootstrap resolver maintained
+# by the RDAP community that routes to the correct registry (Verisign for .com,
+# RIPE for .eu, etc.) — effectively the ICANN-backed replacement for WHOIS.
+# No API key required.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def lookup_domain_registrant(hostname):
+    """
+    Look up the registrant (owner) of a domain name using RDAP.
+
+    Strips the hostname down to its registrable domain (e.g. "dns.google.com"
+    becomes "google.com") and queries rdap.org, which bootstraps to the correct
+    registry for any TLD.
+
+    Args:
+        hostname (str): A fully-qualified domain name, e.g. "dns.google.com"
+
+    Returns:
+        str: Registrant name, or empty string if not found / lookup failed.
+    """
+    # Extract the registrable domain (last two labels, e.g. "google.com")
+    parts = hostname.rstrip(".").split(".")
+    if len(parts) < 2:
+        return ""
+    domain = ".".join(parts[-2:])
+
+    url = f"https://rdap.org/domain/{domain}"
+    try:
+        req = urllib.request.Request(
+            url, headers={"Accept": "application/rdap+json"}
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode())
+
+        # Walk entities for a name, preferring registrant/administrative then
+        # falling back to registrar (registrant vCards are often blank due to
+        # WHOIS privacy protections, but registrar is nearly always populated).
+        def _fn_for_roles(roles):
+            for role in roles:
+                for entity in data.get("entities", []):
+                    if role not in entity.get("roles", []):
+                        continue
+                    vcard = entity.get("vcardArray", [])
+                    if len(vcard) >= 2:
+                        for prop in vcard[1]:
+                            if prop[0] == "fn" and prop[3]:
+                                return prop[3]
+            return ""
+
+        return (
+            _fn_for_roles(("registrant", "administrative"))
+            or _fn_for_roles(("registrar",))
+        )
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, KeyError):
+        pass
+    return ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # THREAT INTELLIGENCE LOOKUP
 # Queries two free, keyless public APIs to surface threat signals for public
 # IP addresses.  Results are merged into a single dict so the caller only needs
@@ -759,8 +820,9 @@ def get_ip_info(ip_string):
         "ipv6_6to4": ipv6_6to4,
         "comment": get_ip_comment(ip_obj, ip_type),
         "reverse_dns": reverse_dns_lookup(ip_obj),
-        "rdap": None,           # populated below for public addresses
-        "threat_intel": None,   # populated below for public addresses
+        "domain_registrant": "",  # populated below if reverse DNS found a hostname
+        "rdap": None,             # populated below for public addresses
+        "threat_intel": None,     # populated below for public addresses
     }
 
     # ── Network lookups (public addresses only) ───────────────────────────────
@@ -776,6 +838,11 @@ def get_ip_info(ip_string):
         and not ip_obj.is_reserved
         and not ip_obj.is_unspecified
     )
+    # Look up the domain registrant for the first reverse DNS hostname found,
+    # regardless of whether the IP is public (PTR records exist for private IPs too).
+    if result["reverse_dns"]:
+        result["domain_registrant"] = lookup_domain_registrant(result["reverse_dns"][0])
+
     if is_public:
         result["rdap"] = lookup_rdap(ip_obj)
         result["threat_intel"] = lookup_threat_intel(ip_obj)
@@ -901,6 +968,8 @@ def print_ip_table(info):
         divider()
         for i, name in enumerate(info['reverse_dns']):
             row("Reverse DNS" if i == 0 else "", name)
+        if info.get('domain_registrant'):
+            row("Domain Registrar", info['domain_registrant'])
     # ── IPv6 representations (conditional, IPv4 only) ─────────────────────
     if info['ipv6_mapped']:
         divider()
