@@ -950,7 +950,7 @@ def lookup_xforce(ip_obj):
     token = base64.b64encode(f"{api_key}:{api_pwd}".encode()).decode()
     try:
         req = urllib.request.Request(
-            f"https://api.xforce.ibmcloud.com/ipr/{ip_obj}",
+            f"https://apps.xforce.quit/ipr/{ip_obj}",
             headers={"Accept": "application/json", "Authorization": f"Basic {token}"}
         )
         with urllib.request.urlopen(req, timeout=8) as resp:
@@ -1341,7 +1341,7 @@ def check_connectivity():
         xf_token = base64.b64encode(f"{xf_key}:{xf_pwd}".encode()).decode()
         probes.append((
             "IBM X-Force ⁴",
-            f"https://api.xforce.ibmcloud.com/ipr/{TEST_IP}",
+            f"https://apps.xforce.ibmcloud.com/ipr/{TEST_IP}",
             {"Accept": "application/json", "Authorization": f"Basic {xf_token}"},
             None,
         ))
