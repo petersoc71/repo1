@@ -1379,36 +1379,10 @@ def check_connectivity():
 
 def main():
     """
-    Main function to demonstrate IP validation
+    IP Address Validator — interactive mode.
     """
-    # Test cases — one of each interesting category so the batch output
-    # exercises all code paths in print_ip_table().
-    test_ips = [
-        "192.168.1.1",          # Valid private IPv4, defaults to /32
-        "8.8.8.8/24",           # Valid public IPv4 network
-        "255.255.255.255",      # Valid IPv4 (broadcast)
-        "256.1.1.1",            # Invalid IPv4 (out of range)
-        "192.168.1",            # Invalid IPv4 (incomplete)
-        "192.168.1.1.1",        # Invalid IPv4 (too many octets)
-        "192.168.01.1",         # Invalid IPv4 (leading zero)
-        "::1",                  # Valid IPv6 (loopback)
-        "2001:0db8:85a3::8a2e:0370:7334/64",  # Valid IPv6 network
-        "fe80::1",              # Valid IPv6 (link-local)
-        "not.an.ip.address",    # Invalid
-        "127.0.0.1",            # Valid IPv4 (loopback)
-        "0.0.0.0",              # Valid IPv4 (all zeros)
-    ]
-
     print("=" * 76)
     print("  IP ADDRESS VALIDATOR")
-    print("=" * 76)
-
-    # Run each test case through the full pipeline and render its table.
-    for ip in test_ips:
-        print()
-        print_ip_table(get_ip_info(ip))
-
-    print()
     print("=" * 76)
 
     # Clear any history that leaked in from the shell / previous runs so the
