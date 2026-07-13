@@ -9,7 +9,8 @@ re           – regular-expression engine; used for the regex-based IPv4 valida
 ipaddress    – stdlib module that parses, validates, and classifies IP addresses
                and networks for both IPv4 and IPv6
 json         – decodes JSON responses returned by the external REST APIs
-os           – reads ABUSEIPDB_API_KEY from the environment
+os           – reads API keys from the environment
+base64       – encodes the X-Force Basic Auth credential header
 socket       – provides gethostbyaddr() for reverse DNS (PTR record) lookups
 urllib       – stdlib HTTP client used to call RDAP and threat-intel APIs
                without requiring any third-party packages
@@ -20,6 +21,7 @@ import re
 import ipaddress
 import json
 import os
+import base64
 import socket
 import urllib.request
 import urllib.error
@@ -30,6 +32,26 @@ try:
     load_dotenv()
 except ImportError:
     pass   # python-dotenv not installed — fall back to pure environment variables
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COLOUR HELPERS
+# Wrap text in ANSI escape codes only when stdout is an interactive terminal.
+# When output is piped or redirected the raw text is returned unchanged so
+# downstream tools are not polluted with escape sequences.
+# ─────────────────────────────────────────────────────────────────────────────
+
+import sys as _sys
+
+def _c(text, code):
+    """Return text wrapped in ANSI colour `code`, or plain text if not a tty."""
+    if _sys.stdout.isatty():
+        return f"\033[{code}m{text}\033[0m"
+    return text
+
+def _red(text):    return _c(text, "31")
+def _yellow(text): return _c(text, "33")
+def _green(text):  return _c(text, "32")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -589,115 +611,6 @@ def lookup_threat_intel(ip_obj):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ABUSEIPDB THREAT LOOKUP
-# Queries the AbuseIPDB API (https://www.abuseipdb.com) for the abuse
-# confidence score, category list, ISP, country, and report history of a
-# given IP address.
-#
-# Authentication uses a single API key sent as the "Key" HTTP header, read
-# from the environment variable ABUSEIPDB_API_KEY (loaded from .env).
-# Free tier: 1 000 checks / day.  Sign up at https://www.abuseipdb.com/register
-#
-# API reference: https://docs.abuseipdb.com/#check-endpoint
-# ─────────────────────────────────────────────────────────────────────────────
-
-# AbuseIPDB category ID → human-readable name mapping (from their docs).
-_ABUSEIPDB_CATS = {
-    1:  "DNS Compromise",       2:  "DNS Poisoning",
-    3:  "Fraud Orders",         4:  "DDoS Attack",
-    5:  "FTP Brute-Force",      6:  "Ping of Death",
-    7:  "Phishing",             8:  "Fraud VoIP",
-    9:  "Open Proxy",           10: "Web Spam",
-    11: "Email Spam",           12: "Blog Spam",
-    13: "VPN IP",               14: "Port Scan",
-    15: "Hacking",              16: "SQL Injection",
-    17: "Spoofing",             18: "Brute-Force",
-    19: "Bad Web Bot",          20: "Exploited Host",
-    21: "Web App Attack",       22: "SSH",
-    23: "IoT Targeted",
-}
-
-def lookup_abuseipdb(ip_obj):
-    """
-    Query AbuseIPDB for IP reputation data.
-
-    Requires environment variable:
-        ABUSEIPDB_API_KEY  – free API key from abuseipdb.com/register
-
-    Args:
-        ip_obj: IPv4Address or IPv6Address object
-
-    Returns:
-        dict with keys:
-            score      (float)  – abuse confidence score 0–100
-            cats       (list)   – human-readable abuse category names
-            isp        (str)    – ISP / organisation name
-            country    (str)    – country name
-            total_reports (int) – total number of abuse reports
-            last_reported (str) – date of most recent report (ISO format)
-            reason     (str)    – plain-English summary line
-        or None if the API key is missing, the IP has no record, or the call fails.
-    """
-    api_key = os.environ.get("ABUSEIPDB_API_KEY", "").strip()
-    if not api_key:
-        return None   # not configured — skip silently
-
-    try:
-        req = urllib.request.Request(
-            f"https://api.abuseipdb.com/api/v2/check"
-            f"?ipAddress={ip_obj}&maxAgeInDays=90&verbose",
-            headers={
-                "Accept": "application/json",
-                "Key":    api_key,
-            }
-        )
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            d = json.loads(resp.read().decode()).get("data", {})
-    except urllib.error.HTTPError:
-        return None
-    except (urllib.error.URLError, OSError, json.JSONDecodeError):
-        return None
-
-    score = d.get("abuseConfidenceScore")
-    if score is None:
-        return None
-
-    # Resolve numeric category IDs to names, deduplicating across reports.
-    raw_cats = d.get("reports") or []
-    seen_cats = set()
-    for report in raw_cats:
-        for cid in report.get("categories", []):
-            name = _ABUSEIPDB_CATS.get(cid)
-            if name:
-                seen_cats.add(name)
-    cats = sorted(seen_cats)
-
-    total_reports  = d.get("totalReports", 0)
-    last_reported  = (d.get("lastReportedAt") or "")[:10]   # trim to YYYY-MM-DD
-    isp            = d.get("isp", "")
-    country        = d.get("countryName", "")
-
-    if score >= 75:
-        reason = "High confidence malicious"
-    elif score >= 25:
-        reason = "Moderate abuse activity"
-    elif total_reports > 0:
-        reason = "Low-level abuse reports"
-    else:
-        reason = "No abuse reports"
-
-    return {
-        "score":         score,
-        "cats":          cats,
-        "isp":           isp,
-        "country":       country,
-        "total_reports": total_reports,
-        "last_reported": last_reported,
-        "reason":        reason,
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # WELL-KNOWN ADDRESS COMMENT LOOKUP
 # Maps an IP address to a plain-English description of its reserved or special
 # purpose.  Checks are ordered most-specific → most-general so that, for
@@ -941,16 +854,15 @@ def get_ip_info(ip_string):
         "reverse_dns": reverse_dns_lookup(ip_obj),
         "domain_registrant": "",  # populated below if reverse DNS found a hostname
         "rdap": None,             # populated below for public addresses
-        "threat_intel": None,     # populated below for public addresses
-        "abuseipdb": None,        # populated below for public addresses
+        "threat_intel": None,     # populated on demand via enrich_threat_intel()
+        "abuseipdb": None,        # populated on demand via enrich_threat_intel()
+        "xforce": None,           # populated on demand via enrich_threat_intel()
+        "_ip_obj": ip_obj,        # retained so enrich_threat_intel() can use it
     }
 
     # ── Network lookups (public addresses only) ───────────────────────────────
-    # We only call RDAP and threat-intel APIs when the address is actually
-    # reachable on the public internet.  Private, loopback, multicast, reserved,
-    # and unspecified addresses are all excluded so we don't waste network
-    # round-trips and don't mislead the user with "no data" for RFC 1918 IPs.
-    # Only hit the network for addresses that are actually globally routable
+    # We only call RDAP when the address is actually reachable on the public
+    # internet.  Threat intel is deferred — called separately on user request.
     is_public = (
         not ip_obj.is_private
         and not ip_obj.is_loopback
@@ -965,10 +877,125 @@ def get_ip_info(ip_string):
 
     if is_public:
         result["rdap"] = lookup_rdap(ip_obj)
-        result["threat_intel"] = lookup_threat_intel(ip_obj)
-        result["abuseipdb"] = lookup_abuseipdb(ip_obj)
 
     return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ON-DEMAND THREAT ENRICHMENT
+# Three lookup functions (ip-api/SFS already in lookup_threat_intel above,
+# AbuseIPDB, and IBM X-Force) plus enrich_threat_intel() which calls all three
+# and writes the results back into the info dict in-place.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# AbuseIPDB category ID → human-readable name (from their docs).
+_ABUSEIPDB_CATS = {
+    1:  "DNS Compromise",   2:  "DNS Poisoning",   3:  "Fraud Orders",
+    4:  "DDoS Attack",      5:  "FTP Brute-Force",  6:  "Ping of Death",
+    7:  "Phishing",         8:  "Fraud VoIP",       9:  "Open Proxy",
+    10: "Web Spam",         11: "Email Spam",       12: "Blog Spam",
+    13: "VPN IP",           14: "Port Scan",        15: "Hacking",
+    16: "SQL Injection",    17: "Spoofing",         18: "Brute-Force",
+    19: "Bad Web Bot",      20: "Exploited Host",   21: "Web App Attack",
+    22: "SSH",              23: "IoT Targeted",
+}
+
+def lookup_abuseipdb(ip_obj):
+    """Query AbuseIPDB (ABUSEIPDB_API_KEY) for abuse confidence and categories."""
+    api_key = os.environ.get("ABUSEIPDB_API_KEY", "").strip()
+    if not api_key:
+        return None
+    try:
+        req = urllib.request.Request(
+            f"https://api.abuseipdb.com/api/v2/check"
+            f"?ipAddress={ip_obj}&maxAgeInDays=90&verbose",
+            headers={"Accept": "application/json", "Key": api_key}
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            d = json.loads(resp.read().decode()).get("data", {})
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, json.JSONDecodeError):
+        return None
+    score = d.get("abuseConfidenceScore")
+    if score is None:
+        return None
+    seen_cats = set()
+    for report in (d.get("reports") or []):
+        for cid in report.get("categories", []):
+            name = _ABUSEIPDB_CATS.get(cid)
+            if name:
+                seen_cats.add(name)
+    total  = d.get("totalReports", 0)
+    last   = (d.get("lastReportedAt") or "")[:10]
+    if score >= 75:
+        reason = "High confidence malicious"
+    elif score >= 25:
+        reason = "Moderate abuse activity"
+    elif total > 0:
+        reason = "Low-level abuse reports"
+    else:
+        reason = "No abuse reports"
+    return {
+        "score": score, "cats": sorted(seen_cats),
+        "isp": d.get("isp", ""), "country": d.get("countryName", ""),
+        "total_reports": total, "last_reported": last, "reason": reason,
+    }
+
+
+def lookup_xforce(ip_obj):
+    """Query IBM X-Force Exchange (XFORCE_API_KEY + XFORCE_API_PASSWORD)."""
+    api_key = os.environ.get("XFORCE_API_KEY", "").strip()
+    api_pwd = os.environ.get("XFORCE_API_PASSWORD", "").strip()
+    if not api_key or not api_pwd:
+        return None
+    token = base64.b64encode(f"{api_key}:{api_pwd}".encode()).decode()
+    try:
+        req = urllib.request.Request(
+            f"https://api.xforce.ibmcloud.com/ipr/{ip_obj}",
+            headers={"Accept": "application/json", "Authorization": f"Basic {token}"}
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            d = json.loads(resp.read().decode())
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, json.JSONDecodeError):
+        return None
+    score = d.get("score")
+    if score is None:
+        return None
+    raw_cats = d.get("cats", {})
+    cats = sorted(raw_cats.keys()) if isinstance(raw_cats, dict) else []
+    country = d.get("geo", {}).get("country", "")
+    subnets = d.get("subnets", [])
+    subnet  = subnets[0].get("subnet", "") if subnets else ""
+    if cats:
+        reason = cats[0] + (f" (+{len(cats)-1} more)" if len(cats) > 1 else "")
+    elif score >= 1:
+        reason = "Reported malicious activity"
+    else:
+        reason = "No threats reported"
+    return {
+        "score": score, "cats": cats,
+        "country": country, "subnet": subnet, "reason": reason,
+    }
+
+
+def enrich_threat_intel(info):
+    """
+    Populate threat_intel, abuseipdb, and xforce fields of a get_ip_info()
+    result dict in-place.  Called separately so the caller controls when to
+    pay the network cost of these lookups.
+    """
+    ip_obj = info.get("_ip_obj")
+    if ip_obj is None:
+        return info
+    is_public = (
+        not ip_obj.is_private   and not ip_obj.is_loopback
+        and not ip_obj.is_multicast and not ip_obj.is_reserved
+        and not ip_obj.is_unspecified
+    )
+    if is_public:
+        info["threat_intel"] = lookup_threat_intel(ip_obj)
+        info["abuseipdb"]    = lookup_abuseipdb(ip_obj)
+        info["xforce"]       = lookup_xforce(ip_obj)   # None unless on IBM network
+    return info
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -984,9 +1011,13 @@ def get_ip_info(ip_string):
 #   divider() — a horizontal rule between groups of related rows
 # ─────────────────────────────────────────────────────────────────────────────
 
-def print_ip_table(info):
+def print_ip_table(info, show_threat=True):
     """
     Print a formatted two-column table for the result of get_ip_info().
+
+    Args:
+        info:         dict returned by get_ip_info() (optionally enriched).
+        show_threat:  if False, the Threat Intelligence section is omitted.
 
     Layout
     ------
@@ -1106,18 +1137,17 @@ def print_ip_table(info):
         row("Network Name",     rdap['network_name'])
         row("Registered Block", rdap['cidr_block'])
 
-    # ── Threat intelligence ───────────────────────────────────────────────
+    # ── Threat intelligence (optional) ───────────────────────────────────
     # Superscript markers on labels show which service provided each field:
-    #   ¹ ip-api.com  ² StopForumSpam  ³ AbuseIPDB
-    # A legend listing only the sources that contributed is printed at the
-    # bottom of the section so the table stays self-documenting.
+    #   ¹ ip-api.com  ² StopForumSpam  ³ AbuseIPDB  ⁴ IBM X-Force
+    # A sources legend is printed at the foot of the section so the reader
+    # can trace every labelled field back to its origin.
     ti = info.get('threat_intel')
     ab = info.get('abuseipdb')
+    xf = info.get('xforce')
 
-    if ti or ab:
-        # Track which source numbers appear so the legend is exact.
+    if show_threat and (ti or ab or xf):
         sources_used = []
-
         section("Threat Intelligence")
 
         if ti:
@@ -1147,35 +1177,53 @@ def print_ip_table(info):
         if ab:
             sources_used.append(3)
             if ti:
-                divider()   # visual break between the two sub-sections
+                divider()
             score = ab['score']
             if score >= 75:
-                score_label = f"{score}%  ⚠  HIGH RISK"
-            elif score >= 25:
-                score_label = f"{score}%  –  Moderate risk"
+                lbl = _red(f"{score}%  ⚠  HIGH RISK")
+            elif score > 0:
+                lbl = _yellow(f"{score}%  –  Moderate risk" if score >= 25 else f"{score}%  –  Low risk")
             else:
-                score_label = f"{score}%  –  Low risk"
-            row("Abuse Score ³",    score_label)
+                lbl = _green(f"{score}%  –  No risk")
+            row("Abuse Score ³",    lbl)
             row("Summary ³",        ab['reason'])
             if ab['cats']:
-                row("Categories ³",     ", ".join(ab['cats']))
+                row("Categories ³",    ", ".join(ab['cats']))
             if ab['total_reports']:
                 last = f"  (last: {ab['last_reported']})" if ab['last_reported'] else ""
-                row("Reports ³",        f"{ab['total_reports']}{last}")
+                row("Reports ³",       f"{ab['total_reports']}{last}")
             if ab['isp']:
-                row("ISP ³",            ab['isp'])
+                row("ISP ³",           ab['isp'])
             if ab['country']:
-                row("Country ³",        ab['country'])
+                row("Country ³",       ab['country'])
+
+        if xf:
+            sources_used.append(4)
+            divider()
+            score = xf['score']
+            if score >= 7:
+                lbl = _red(f"{score:.1f} / 10  ⚠  HIGH RISK")
+            elif score > 0:
+                lbl = _yellow(f"{score:.1f} / 10  –  Medium risk" if score >= 4 else f"{score:.1f} / 10  –  Low risk")
+            else:
+                lbl = _green(f"{score:.1f} / 10  –  No risk")
+            row("XF Risk Score ⁴",  lbl)
+            row("XF Summary ⁴",     xf['reason'])
+            if xf['cats']:
+                row("XF Categories ⁴",  ", ".join(xf['cats']))
+            if xf['country']:
+                row("XF Geo ⁴",         xf['country'])
+            if xf['subnet']:
+                row("XF Subnet ⁴",      xf['subnet'])
 
         # ── Sources legend ────────────────────────────────────────────────
-        # Full-width rows listing every source that contributed data, so the
-        # reader can trace the superscript on any label back to its origin.
         _legend_map = {
             1: "¹ ip-api.com    – geo, ISP, ASN, proxy/VPN, hosting flags",
             2: "² StopForumSpam – Tor exit node, abuse report frequency",
             3: "³ AbuseIPDB     – abuse confidence score, attack categories",
+            4: "⁴ IBM X-Force   – risk score, threat categories (IBM network)",
         }
-        inner = TOTAL - 4   # usable chars between '│ ' and ' │'
+        inner = TOTAL - 4
         print(f"├─{'─' * (TOTAL - 2)}─┤")
         print(f"│ {'Sources':<{inner}} │")
         for n in sorted(set(sources_used)):
@@ -1194,6 +1242,140 @@ def print_ip_table(info):
 #   2. Interactive — prompts the user to enter addresses one at a time until
 #                    they type 'quit', 'exit', or 'q'.
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONNECTIVITY HEALTH CHECK
+# check_connectivity() probes each external data source used by the tool and
+# prints a formatted status report showing reachability, credential status, and
+# response latency for every service.  Called from the interactive prompt when
+# the user types '!check'.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def check_connectivity():
+    """
+    Probe every external API / data source and print a health-check table.
+
+    Checks performed
+    ----------------
+    1. ip-api.com           – keyless geo/proxy lookup (IPv4 only)
+    2. StopForumSpam        – keyless abuse database
+    3. ARIN RDAP            – keyless registration data
+    4. AbuseIPDB            – keyed API  (ABUSEIPDB_API_KEY in .env)
+    5. IBM X-Force Exchange – keyed API  (XFORCE_API_KEY + XFORCE_API_PASSWORD)
+
+    Each probe uses the real endpoint with a benign test IP (8.8.8.8) so the
+    result reflects actual end-to-end connectivity, not just DNS resolution.
+    """
+    import time
+
+    TEST_IP = "8.8.8.8"   # Google DNS — globally reachable, always has records
+    W  = 76               # total line width (matches the === header)
+    W2 = 22               # width of the service-name column
+
+    def _probe(label, url, headers=None, expect_key=None):
+        """
+        Make one GET request and return a (status, latency_ms, note) tuple.
+        status is one of: 'OK', 'AUTH', 'UNREACH', 'NO KEY'.
+        """
+        if expect_key == "missing":
+            return ("NO KEY", None, "API key not configured in .env")
+
+        t0 = time.monotonic()
+        try:
+            req = urllib.request.Request(url, headers=headers or {})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                resp.read()   # consume body so the socket closes cleanly
+            ms = int((time.monotonic() - t0) * 1000)
+            return ("OK", ms, "Reachable")
+        except urllib.error.HTTPError as e:
+            ms = int((time.monotonic() - t0) * 1000)
+            if e.code in (401, 403):
+                return ("AUTH", ms, f"HTTP {e.code} — credentials rejected")
+            return ("UNREACH", ms, f"HTTP {e.code}")
+        except Exception as e:
+            return ("UNREACH", None, str(e)[:60])
+
+    # ── build the probe list ──────────────────────────────────────────────────
+    probes = []
+
+    # 1. ip-api.com (keyless)
+    probes.append((
+        "ip-api.com ¹",
+        f"http://ip-api.com/json/{TEST_IP}?fields=status",
+        {"Accept": "application/json"},
+        None,
+    ))
+
+    # 2. StopForumSpam (keyless)
+    probes.append((
+        "StopForumSpam ²",
+        f"https://api.stopforumspam.org/api?ip={TEST_IP}&json",
+        {"Accept": "application/json"},
+        None,
+    ))
+
+    # 3. ARIN RDAP (keyless)
+    probes.append((
+        "ARIN RDAP",
+        f"https://rdap.arin.net/registry/ip/{TEST_IP}",
+        {"Accept": "application/json"},
+        None,
+    ))
+
+    # 4. AbuseIPDB (keyed)
+    ab_key = os.environ.get("ABUSEIPDB_API_KEY", "").strip()
+    if ab_key:
+        probes.append((
+            "AbuseIPDB ³",
+            f"https://api.abuseipdb.com/api/v2/check?ipAddress={TEST_IP}&maxAgeInDays=1",
+            {"Accept": "application/json", "Key": ab_key},
+            None,
+        ))
+    else:
+        probes.append(("AbuseIPDB ³", None, {}, "missing"))
+
+    # 5. IBM X-Force (keyed — Basic Auth)
+    xf_key = os.environ.get("XFORCE_API_KEY", "").strip()
+    xf_pwd = os.environ.get("XFORCE_API_PASSWORD", "").strip()
+    if xf_key and xf_pwd:
+        xf_token = base64.b64encode(f"{xf_key}:{xf_pwd}".encode()).decode()
+        probes.append((
+            "IBM X-Force ⁴",
+            f"https://api.xforce.ibmcloud.com/ipr/{TEST_IP}",
+            {"Accept": "application/json", "Authorization": f"Basic {xf_token}"},
+            None,
+        ))
+    else:
+        probes.append(("IBM X-Force ⁴", None, {}, "missing"))
+
+    # ── print the results table ───────────────────────────────────────────────
+    STATUS_ICON = {
+        "OK":      "✓  OK",
+        "AUTH":    "✗  Auth failed",
+        "UNREACH": "✗  Unreachable",
+        "NO KEY":  "–  Not configured",
+    }
+
+    print()
+    print("=" * W)
+    print("  External Source Connectivity Check")
+    print("=" * W)
+    print(f"  {'Service':<{W2}}  {'Status':<18}  {'Latency':>8}  Note")
+    print(f"  {'-'*W2}  {'-'*18}  {'-'*8}  {'-'*18}")
+
+    for label, url, headers, expect_key in probes:
+        status, ms, note = _probe(label, url, headers, expect_key)
+        icon     = STATUS_ICON[status]
+        latency  = f"{ms} ms" if ms is not None else "—"
+        print(f"  {label:<{W2}}  {icon:<18}  {latency:>8}  {note}")
+
+    print("=" * W)
+    print()
+    print("  Key:  ¹ ip-api.com  ² StopForumSpam  ³ AbuseIPDB  ⁴ IBM X-Force")
+    print("  API keys are read from your .env file (ABUSEIPDB_API_KEY,")
+    print("  XFORCE_API_KEY, XFORCE_API_PASSWORD).")
+    print()
+
 
 def main():
     """
@@ -1238,28 +1420,61 @@ def main():
         pass
 
     # Interactive mode — keep prompting until the user quits.
+    # Two-phase flow per IP:
+    #   Phase 1: fast table immediately (RDAP + reverse DNS, no threat calls).
+    #   Phase 2: prompt — [T] fetch threat intel, [Enter] new IP, [Q] quit.
     print("\nInteractive Mode (type 'quit' to exit)")
     print("This tool takes an IP with or without a CIDR mask and returns info about it.")
+    print("Type '!check' to test connectivity to all external data sources.")
     print("-" * 76)
 
     while True:
         user_input = input("\nEnter IP address or CIDR to validate: ").strip()
 
-        # Accept several common quit commands so the tool feels natural.
         if user_input.lower() in ['quit', 'exit', 'q']:
             print("Goodbye!")
             break
 
-        # Ignore blank lines so the user can press Enter without getting an error.
         if not user_input:
             continue
 
+        if user_input.lower() == '!check':
+            check_connectivity()
+            continue
+
+        # ── Phase 1: fast lookup ──────────────────────────────────────────
         print()
-        print_ip_table(get_ip_info(user_input))
+        info = get_ip_info(user_input)
+        print_ip_table(info, show_threat=False)
+
+        # Only offer threat intel for valid public addresses.
+        ip_obj = info.get("_ip_obj")
+        is_public = (
+            info.get("valid") and ip_obj is not None
+            and not ip_obj.is_private   and not ip_obj.is_loopback
+            and not ip_obj.is_multicast and not ip_obj.is_reserved
+            and not ip_obj.is_unspecified
+        )
+
+        if is_public:
+            # ── Phase 2: optional threat intel ───────────────────────────
+            ti_input = input(
+                "\n  [T] Show Threat Intelligence  "
+                "[Enter] New IP  "
+                "[Q] Quit  › "
+            ).strip().lower()
+
+            if ti_input in ('q', 'quit', 'exit'):
+                print("Goodbye!")
+                break
+
+            if ti_input == 't':
+                print("\n  Fetching threat intelligence…\n")
+                enrich_threat_intel(info)
+                print_ip_table(info, show_threat=True)
 
 
 if __name__ == "__main__":
     main()
 
 # Made with Bob
-
