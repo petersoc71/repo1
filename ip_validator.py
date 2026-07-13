@@ -9,17 +9,27 @@ re           – regular-expression engine; used for the regex-based IPv4 valida
 ipaddress    – stdlib module that parses, validates, and classifies IP addresses
                and networks for both IPv4 and IPv6
 json         – decodes JSON responses returned by the external REST APIs
+os           – reads ABUSEIPDB_API_KEY from the environment
 socket       – provides gethostbyaddr() for reverse DNS (PTR record) lookups
 urllib       – stdlib HTTP client used to call RDAP and threat-intel APIs
                without requiring any third-party packages
+dotenv       – loads .env file credentials into os.environ at startup
 """
 
 import re
 import ipaddress
 import json
+import os
 import socket
 import urllib.request
 import urllib.error
+
+# Load .env file if present (silently ignored when the file does not exist).
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass   # python-dotenv not installed — fall back to pure environment variables
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -579,6 +589,115 @@ def lookup_threat_intel(ip_obj):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ABUSEIPDB THREAT LOOKUP
+# Queries the AbuseIPDB API (https://www.abuseipdb.com) for the abuse
+# confidence score, category list, ISP, country, and report history of a
+# given IP address.
+#
+# Authentication uses a single API key sent as the "Key" HTTP header, read
+# from the environment variable ABUSEIPDB_API_KEY (loaded from .env).
+# Free tier: 1 000 checks / day.  Sign up at https://www.abuseipdb.com/register
+#
+# API reference: https://docs.abuseipdb.com/#check-endpoint
+# ─────────────────────────────────────────────────────────────────────────────
+
+# AbuseIPDB category ID → human-readable name mapping (from their docs).
+_ABUSEIPDB_CATS = {
+    1:  "DNS Compromise",       2:  "DNS Poisoning",
+    3:  "Fraud Orders",         4:  "DDoS Attack",
+    5:  "FTP Brute-Force",      6:  "Ping of Death",
+    7:  "Phishing",             8:  "Fraud VoIP",
+    9:  "Open Proxy",           10: "Web Spam",
+    11: "Email Spam",           12: "Blog Spam",
+    13: "VPN IP",               14: "Port Scan",
+    15: "Hacking",              16: "SQL Injection",
+    17: "Spoofing",             18: "Brute-Force",
+    19: "Bad Web Bot",          20: "Exploited Host",
+    21: "Web App Attack",       22: "SSH",
+    23: "IoT Targeted",
+}
+
+def lookup_abuseipdb(ip_obj):
+    """
+    Query AbuseIPDB for IP reputation data.
+
+    Requires environment variable:
+        ABUSEIPDB_API_KEY  – free API key from abuseipdb.com/register
+
+    Args:
+        ip_obj: IPv4Address or IPv6Address object
+
+    Returns:
+        dict with keys:
+            score      (float)  – abuse confidence score 0–100
+            cats       (list)   – human-readable abuse category names
+            isp        (str)    – ISP / organisation name
+            country    (str)    – country name
+            total_reports (int) – total number of abuse reports
+            last_reported (str) – date of most recent report (ISO format)
+            reason     (str)    – plain-English summary line
+        or None if the API key is missing, the IP has no record, or the call fails.
+    """
+    api_key = os.environ.get("ABUSEIPDB_API_KEY", "").strip()
+    if not api_key:
+        return None   # not configured — skip silently
+
+    try:
+        req = urllib.request.Request(
+            f"https://api.abuseipdb.com/api/v2/check"
+            f"?ipAddress={ip_obj}&maxAgeInDays=90&verbose",
+            headers={
+                "Accept": "application/json",
+                "Key":    api_key,
+            }
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            d = json.loads(resp.read().decode()).get("data", {})
+    except urllib.error.HTTPError:
+        return None
+    except (urllib.error.URLError, OSError, json.JSONDecodeError):
+        return None
+
+    score = d.get("abuseConfidenceScore")
+    if score is None:
+        return None
+
+    # Resolve numeric category IDs to names, deduplicating across reports.
+    raw_cats = d.get("reports") or []
+    seen_cats = set()
+    for report in raw_cats:
+        for cid in report.get("categories", []):
+            name = _ABUSEIPDB_CATS.get(cid)
+            if name:
+                seen_cats.add(name)
+    cats = sorted(seen_cats)
+
+    total_reports  = d.get("totalReports", 0)
+    last_reported  = (d.get("lastReportedAt") or "")[:10]   # trim to YYYY-MM-DD
+    isp            = d.get("isp", "")
+    country        = d.get("countryName", "")
+
+    if score >= 75:
+        reason = "High confidence malicious"
+    elif score >= 25:
+        reason = "Moderate abuse activity"
+    elif total_reports > 0:
+        reason = "Low-level abuse reports"
+    else:
+        reason = "No abuse reports"
+
+    return {
+        "score":         score,
+        "cats":          cats,
+        "isp":           isp,
+        "country":       country,
+        "total_reports": total_reports,
+        "last_reported": last_reported,
+        "reason":        reason,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # WELL-KNOWN ADDRESS COMMENT LOOKUP
 # Maps an IP address to a plain-English description of its reserved or special
 # purpose.  Checks are ordered most-specific → most-general so that, for
@@ -823,6 +942,7 @@ def get_ip_info(ip_string):
         "domain_registrant": "",  # populated below if reverse DNS found a hostname
         "rdap": None,             # populated below for public addresses
         "threat_intel": None,     # populated below for public addresses
+        "abuseipdb": None,        # populated below for public addresses
     }
 
     # ── Network lookups (public addresses only) ───────────────────────────────
@@ -846,6 +966,7 @@ def get_ip_info(ip_string):
     if is_public:
         result["rdap"] = lookup_rdap(ip_obj)
         result["threat_intel"] = lookup_threat_intel(ip_obj)
+        result["abuseipdb"] = lookup_abuseipdb(ip_obj)
 
     return result
 
@@ -986,36 +1107,82 @@ def print_ip_table(info):
         row("Registered Block", rdap['cidr_block'])
 
     # ── Threat intelligence ───────────────────────────────────────────────
-    # Only present for public addresses where at least one threat API succeeded.
+    # Superscript markers on labels show which service provided each field:
+    #   ¹ ip-api.com  ² StopForumSpam  ³ AbuseIPDB
+    # A legend listing only the sources that contributed is printed at the
+    # bottom of the section so the table stays self-documenting.
     ti = info.get('threat_intel')
-    if ti:
+    ab = info.get('abuseipdb')
+
+    if ti or ab:
+        # Track which source numbers appear so the legend is exact.
+        sources_used = []
+
         section("Threat Intelligence")
-        if ti['geo']:
-            row("Geo",         ti['geo'])
-        if ti['isp']:
-            row("ISP",         ti['isp'])
-        if ti['asn']:
-            row("ASN",         ti['asn'])
-        row("Proxy / VPN",     "Yes" if ti['is_proxy']   else "No")
-        row("Hosting / DC",    "Yes" if ti['is_hosting'] else "No")
-        row("Tor Exit",        "Yes" if ti['is_tor']     else "No")
-        # Format the abuse report line differently depending on whether any
-        # reports exist: show count + confidence + date if yes, "None" if no.
-        if ti['abuse_freq'] is not None:
-            if ti['abuse_freq'] > 0:
-                abuse_str = (f"{ti['abuse_freq']} reports,"
-                             f" confidence {ti['abuse_score']:.0f}%,"
-                             f" last seen {ti['abuse_last']}")
+
+        if ti:
+            sources_used += [1, 2]
+            if ti['geo']:
+                row("Geo ¹",           ti['geo'])
+            if ti['isp']:
+                row("ISP ¹",           ti['isp'])
+            if ti['asn']:
+                row("ASN ¹",           ti['asn'])
+            row("Proxy / VPN ¹",       "Yes" if ti['is_proxy']   else "No")
+            row("Hosting / DC ¹",      "Yes" if ti['is_hosting'] else "No")
+            row("Tor Exit ²",          "Yes" if ti['is_tor']     else "No")
+            if ti['abuse_freq'] is not None:
+                if ti['abuse_freq'] > 0:
+                    abuse_str = (f"{ti['abuse_freq']} reports,"
+                                 f" confidence {ti['abuse_score']:.0f}%,"
+                                 f" last seen {ti['abuse_last']}")
+                else:
+                    abuse_str = "None"
+                row("Abuse Reports ²", abuse_str)
+            if ti['flags']:
+                row("⚑  Flags",        ", ".join(ti['flags']))
             else:
-                abuse_str = "None"
-            row("Abuse Reports", abuse_str)
-        if ti['flags']:
-            row("⚑  Flags", ", ".join(ti['flags']))
-        else:
-            row("⚑  Flags", "none")
+                row("⚑  Flags",        "none")
+
+        if ab:
+            sources_used.append(3)
+            if ti:
+                divider()   # visual break between the two sub-sections
+            score = ab['score']
+            if score >= 75:
+                score_label = f"{score}%  ⚠  HIGH RISK"
+            elif score >= 25:
+                score_label = f"{score}%  –  Moderate risk"
+            else:
+                score_label = f"{score}%  –  Low risk"
+            row("Abuse Score ³",    score_label)
+            row("Summary ³",        ab['reason'])
+            if ab['cats']:
+                row("Categories ³",     ", ".join(ab['cats']))
+            if ab['total_reports']:
+                last = f"  (last: {ab['last_reported']})" if ab['last_reported'] else ""
+                row("Reports ³",        f"{ab['total_reports']}{last}")
+            if ab['isp']:
+                row("ISP ³",            ab['isp'])
+            if ab['country']:
+                row("Country ³",        ab['country'])
+
+        # ── Sources legend ────────────────────────────────────────────────
+        # Full-width rows listing every source that contributed data, so the
+        # reader can trace the superscript on any label back to its origin.
+        _legend_map = {
+            1: "¹ ip-api.com    – geo, ISP, ASN, proxy/VPN, hosting flags",
+            2: "² StopForumSpam – Tor exit node, abuse report frequency",
+            3: "³ AbuseIPDB     – abuse confidence score, attack categories",
+        }
+        inner = TOTAL - 4   # usable chars between '│ ' and ' │'
+        print(f"├─{'─' * (TOTAL - 2)}─┤")
+        print(f"│ {'Sources':<{inner}} │")
+        for n in sorted(set(sources_used)):
+            print(f"│  {_legend_map[n]:<{inner - 1}} │")
 
     # ── bottom border ─────────────────────────────────────────────────────
-    print(f"└─{'─' * (COL1 - 2)}─┴─{'─' * (COL2 - 2)}─┘")
+    print(f"└─{'─' * (TOTAL - 2)}─┘")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
