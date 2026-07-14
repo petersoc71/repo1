@@ -1341,7 +1341,7 @@ def check_connectivity():
         xf_token = base64.b64encode(f"{xf_key}:{xf_pwd}".encode()).decode()
         probes.append((
             "IBM X-Force ⁴",
-            f"https://apps.xforce.ibmcloud.com/ipr/{TEST_IP}",
+            f"https://api.xforce.ibmcloud.com/ipr/{TEST_IP}",
             {"Accept": "application/json", "Authorization": f"Basic {xf_token}"},
             None,
         ))
