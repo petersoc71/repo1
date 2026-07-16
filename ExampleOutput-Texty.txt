@@ -1,0 +1,47 @@
+
+*** IP Address Report: 209.134.191.18 *** 
+===============================================================
+Valid                 ✓ IPv4 address
+CIDR                  /32
+Subnet Mask           255.255.255.255
+Subnet Class          Class C
+Network Address       209.134.191.18
+IP Range              209.134.191.18 - 209.134.191.18
+Host Count            1
+--------------------------------------------------------------
+Private               False
+Loopback              False
+Multicast             False
+Reserved              False
+Note                  Public / globally routable IPv4 address
+IPv6 Mapped           ::ffff:209.134.191.18
+IPv6 6to4             2002:d186:bf12::
+--------------------------------------------------------------
+Reverse DNS           proxy.sec.ibm.com
+RDAP / Registration (ARIN)
+Owner                 IBM
+Network Name          ISS-BLK-1
+Registered Block      209.134.160.0/19
+===============================================================
+
+*Threat Intelligence (If Public)*
+===============================================================
+Geo ¹                 Dallas, Texas, United States
+ISP ¹                 IBM
+ASN ¹                 AS15293 IBM
+Proxy / VPN ¹         No
+Hosting / DC ¹        No
+Tor Exit ²            No
+Abuse Reports ²       None
+⚑  Flags              none
+---------------------------------------------------------------
+Abuse Score ³         0% – No risk
+Summary ³             No abuse reports
+ISP ³                 IBM│
+Country ³             United States of America
+---------------------------------------------------------------
+Sources
+¹ ip-api.com    – geo, ISP, ASN, proxy/VPN, hosting flags
+² StopForumSpam – Tor exit node, abuse report frequency
+³ AbuseIPDB     – abuse confidence score, attack categories
+===============================================================
