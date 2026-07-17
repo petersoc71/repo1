@@ -123,7 +123,7 @@ def classify_mac(mac):
             "is_broadcast":   False,
             "virtual_hint":   None,
             "multicast_hint": None,
-            "note": "All-zeros MAC — not a real address",
+            "note": "All-zeros MAC - not a real address",
         }
     if mac == "FF:FF:FF:FF:FF:FF":
         return {
@@ -134,7 +134,7 @@ def classify_mac(mac):
             "is_virtual":     False,
             "is_broadcast":   True,
             "virtual_hint":   None,
-            "multicast_hint": "Broadcast — sent to all devices on the segment",
+            "multicast_hint": "Broadcast - sent to all devices on the segment",
             "note": "Layer-2 broadcast address",
         }
 
@@ -167,7 +167,7 @@ def classify_mac(mac):
         is_virtual = True
     elif is_local and not is_multicast:
         # LAA but not a known VM prefix — likely OS-randomised (e.g. iOS/Android privacy MACs).
-        virtual_hint = "Locally administered — possibly OS-randomised (privacy MAC)"
+        virtual_hint = "Locally administered - possibly OS-randomised (privacy MAC)"
         is_virtual = True
 
     # Determine the human-readable address type.
@@ -343,21 +343,21 @@ def print_mac_table(mac, classification, vendor):
             row("Country",      vendor["country"])
         row("Search / Website", vendor["website"])
         if classification["is_virtual"] and not classification["is_local"]:
-            row("Hardware Type", _yellow("Virtual — known hypervisor manufacturer"))
+            row("Hardware Type", _yellow("Virtual - known hypervisor manufacturer"))
         elif classification["is_virtual"]:
             row("Hardware Type", _yellow("Virtual or software-assigned (randomised)"))
         else:
-            row("Hardware Type", _green("Physical — vendor-assigned hardware address"))
+            row("Hardware Type", _green("Physical - vendor-assigned hardware address"))
     else:
         if classification["is_local"]:
             row("Company",       "Not registered (locally administered address)")
             row("Hardware Type", _yellow("Virtual or software-assigned (LAA bit set)"))
         elif classification["is_virtual"]:
             row("Company",       "Not in public registry")
-            row("Hardware Type", _yellow("Virtual — matches known hypervisor prefix"))
+            row("Hardware Type", _yellow("Virtual - matches known hypervisor prefix"))
         else:
             row("Company",       "Not found in public OUI registry")
-            row("Hardware Type", "Unknown — may be a private or custom NIC")
+            row("Hardware Type", "Unknown - may be a private or custom NIC")
 
     # ── bottom border ──────────────────────────────────────────────────────
     print(f"└─{'─'*(TOTAL-2)}─┘")
