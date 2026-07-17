@@ -25,6 +25,9 @@ import base64
 import socket
 import urllib.request
 import urllib.error
+import csv
+import argparse
+import sys
 
 # Load .env file if present (silently ignored when the file does not exist).
 try:
@@ -1377,10 +1380,158 @@ def check_connectivity():
     print()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# BATCH / CSV MODE
+# write_csv_report() converts a list of get_ip_info() result dicts into a CSV
+# file.  batch_mode() parses the IP list from --ips or --file, calls
+# get_ip_info() for each entry, and writes the output CSV.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Ordered column definitions: (csv_header, info_key_or_callable)
+# Each entry is either a plain key into the info dict, or a lambda that
+# derives a value from the dict.  The order here becomes the column order.
+_CSV_COLUMNS = [
+    ("Input",           lambda i: i["ip"]),
+    ("Valid",           lambda i: i["valid"]),
+    ("Type",            lambda i: i.get("type") or ""),
+    ("CIDR",            lambda i: i.get("cidr") or ""),
+    ("Subnet Mask",     lambda i: i.get("subnet_mask") or ""),
+    ("Subnet Class",    lambda i: i.get("subnet_class") or ""),
+    ("Network Address", lambda i: i.get("network_address") or ""),
+    ("IP Range",        lambda i: i.get("ip_range") or ""),
+    ("Host Count",      lambda i: i.get("host_count") if i.get("host_count") is not None else ""),
+    ("Private",         lambda i: i.get("is_private") if i.get("is_private") is not None else ""),
+    ("Loopback",        lambda i: i.get("is_loopback") if i.get("is_loopback") is not None else ""),
+    ("Multicast",       lambda i: i.get("is_multicast") if i.get("is_multicast") is not None else ""),
+    ("Reserved",        lambda i: i.get("is_reserved") if i.get("is_reserved") is not None else ""),
+    ("Note",            lambda i: i.get("comment") or ""),
+    ("Reverse DNS",     lambda i: "; ".join(i["reverse_dns"]) if i.get("reverse_dns") else ""),
+    ("Domain Registrar",lambda i: i.get("domain_registrant") or ""),
+    ("IPv6 Mapped",     lambda i: i.get("ipv6_mapped") or ""),
+    ("IPv6 6to4",       lambda i: i.get("ipv6_6to4") or ""),
+    # RDAP fields — blank for private/invalid addresses
+    ("RDAP Owner",      lambda i: (i.get("rdap") or {}).get("org") or ""),
+    ("RDAP Network",    lambda i: (i.get("rdap") or {}).get("network_name") or ""),
+    ("RDAP Block",      lambda i: (i.get("rdap") or {}).get("cidr_block") or ""),
+]
+
+
+def write_csv_report(results, output_path):
+    """
+    Write a list of get_ip_info() dicts to a CSV file.
+
+    Args:
+        results     – list of dicts as returned by get_ip_info()
+        output_path – file path string for the output .csv
+    """
+    headers = [col[0] for col in _CSV_COLUMNS]
+    with open(output_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=headers)
+        writer.writeheader()
+        for info in results:
+            row = {header: extractor(info) for header, extractor in _CSV_COLUMNS}
+            writer.writerow(row)
+
+
+def batch_mode(ip_sources, output_path):
+    """
+    Process a list of IP / CIDR strings and write results to a CSV file.
+
+    Args:
+        ip_sources  – list of raw strings (may be comma-separated or one-per-item)
+        output_path – destination .csv path
+    """
+    # Normalise: split on commas then strip whitespace; skip blank tokens.
+    raw_tokens = []
+    for item in ip_sources:
+        raw_tokens.extend(item.split(","))
+    ips = [t.strip() for t in raw_tokens if t.strip()]
+
+    if not ips:
+        print("Error: no IP addresses supplied.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Processing {len(ips)} address(es)…")
+    results = []
+    for ip in ips:
+        print(f"  {ip}", end="  ", flush=True)
+        info = get_ip_info(ip)
+        results.append(info)
+        print("✓" if info["valid"] else "✗ (invalid)")
+
+    write_csv_report(results, output_path)
+    print(f"\nReport written to: {output_path}")
+
+
 def main():
     """
-    IP Address Validator — interactive mode.
+    IP Address Validator — interactive mode or batch CSV mode.
+
+    Batch mode (--ips or --file):
+        ip_validator.py --ips "1.2.3.4, 10.0.0.0/8" --output report.csv
+        ip_validator.py --file ips.txt --output report.csv
+
+    Interactive mode (no arguments):
+        ip_validator.py
     """
+    parser = argparse.ArgumentParser(
+        prog="ip_validator",
+        description="IP Address Validator — interactive or batch CSV mode.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  # Interactive mode (no arguments)\n"
+            "  ip_validator.py\n"
+            "\n"
+            "  # Comma-separated list inline\n"
+            "  ip_validator.py --ips \"8.8.8.8, 192.168.1.0/24, 10.0.0.1\"\n"
+            "\n"
+            "  # One IP per line in a text file\n"
+            "  ip_validator.py --file ips.txt\n"
+            "\n"
+            "  # Custom output path (default: ip_report.csv)\n"
+            "  ip_validator.py --ips \"1.2.3.4\" --output /tmp/results.csv\n"
+            "\n"
+            "  # Combine inline list and file into one report\n"
+            "  ip_validator.py --ips \"8.8.8.8\" --file extra_ips.txt --output combined.csv\n"
+        ),
+        add_help=True,
+    )
+    parser.add_argument(
+        "--ips",
+        metavar="IP_LIST",
+        help="Comma-separated list of IP addresses or CIDR ranges to validate.",
+    )
+    parser.add_argument(
+        "--file",
+        metavar="PATH",
+        help="Path to a text file containing one IP / CIDR per line "
+             "(or comma-separated on any line).",
+    )
+    parser.add_argument(
+        "--output",
+        metavar="CSV_PATH",
+        default="ip_report.csv",
+        help="Output CSV file path (default: ip_report.csv).",
+    )
+    args = parser.parse_args()
+
+    # ── Batch mode ────────────────────────────────────────────────────────
+    if args.ips or args.file:
+        ip_sources = []
+        if args.ips:
+            ip_sources.append(args.ips)
+        if args.file:
+            try:
+                with open(args.file, encoding="utf-8") as fh:
+                    ip_sources.extend(fh.read().splitlines())
+            except OSError as exc:
+                print(f"Error reading file: {exc}", file=sys.stderr)
+                sys.exit(1)
+        batch_mode(ip_sources, args.output)
+        return
+
+    # ── Interactive mode ──────────────────────────────────────────────────
     print("=" * 76)
     print("  IP ADDRESS VALIDATOR")
     print("=" * 76)
@@ -1400,6 +1551,7 @@ def main():
     print("\nInteractive Mode (type 'quit' to exit)")
     print("This tool takes an IP with or without a CIDR mask and returns info about it.")
     print("Type '!check' to test connectivity to all external data sources.")
+    print("You can also run this application in batch mode. use ip_validator.py --help for details")
     print("-" * 76)
 
     while True:

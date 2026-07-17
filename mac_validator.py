@@ -13,6 +13,8 @@ urllib.parse – encodes the vendor name into a search URL
 
 import re
 import sys
+import csv
+import argparse
 import json
 import urllib.request
 import urllib.error
@@ -74,8 +76,10 @@ def normalise_mac(raw):
     upper-case colon-separated string (e.g. "00:50:56:C0:00:08").
 
     Accepted formats:
-        00:50:56:C0:00:08   (colon-separated)
-        00-50-56-C0-00-08   (hyphen-separated)
+        00:50:56:C0:00:08   (colon-separated, zero-padded)
+        1:0:5e:0:0:fb       (colon-separated, abbreviated octets — zero-padded automatically)
+        00-50-56-C0-00-08   (hyphen-separated, zero-padded)
+        1-0-5e-0-0-fb       (hyphen-separated, abbreviated octets — zero-padded automatically)
         0050.56C0.0008      (Cisco dot-notation)
         005056C00008        (plain hex, no separator)
 
@@ -84,8 +88,28 @@ def normalise_mac(raw):
     # Strip whitespace and convert to upper case.
     s = raw.strip().upper()
 
-    # Remove separators to get a raw 12-hex-digit string.
-    s = s.replace(":", "").replace("-", "").replace(".", "")
+    # If the input uses colon or hyphen separators, split into tokens and
+    # zero-pad each one to two digits before rejoining.  This handles
+    # abbreviated forms like "1:0:5e:0:0:fb" alongside the standard
+    # "01:00:5E:00:00:FB".  Dot-notation and bare hex are already
+    # fixed-width so they don't need this treatment.
+    sep = None
+    if ":" in s:
+        sep = ":"
+    elif "-" in s:
+        sep = "-"
+
+    if sep:
+        tokens = s.split(sep)
+        if len(tokens) == 6 and all(re.fullmatch(r"[0-9A-F]{1,2}", t) for t in tokens):
+            s = "".join(t.zfill(2) for t in tokens)
+        else:
+            # Wrong number of octets or non-hex characters — fall through to
+            # the length check below which will produce the correct error.
+            s = s.replace(sep, "")
+    else:
+        # Dot-notation or bare hex: just strip remaining separators.
+        s = s.replace(".", "")
 
     if not re.fullmatch(r"[0-9A-F]{12}", s):
         return None, f"'{raw}' is not a valid MAC address"
@@ -282,28 +306,25 @@ def print_mac_table(mac, classification, vendor):
     def row(label, value):
         label_str   = str(label)[:inner1].ljust(inner1)
         value_str   = str(value)
-        # Word-wrap long values; for unbreakable strings (e.g. URLs) truncate
-        # hard at inner2 so the right border never overflows.
         value_lines = _wrap(value_str, inner2)
-        value_lines = [ln[:inner2] for ln in value_lines]
-        print(f"│ {label_str} │ {value_lines[0].ljust(inner2)} │")
+        print(f"│ {label_str} │ {value_lines[0]}")
         for extra in value_lines[1:]:
-            print(f"│ {''.ljust(inner1)} │ {extra.ljust(inner2)} │")
+            print(f"│ {''.ljust(inner1)} │ {extra}")
 
     def section(title):
-        inner = COL1 + COL2 - 1   # usable chars between '│ ' and ' │'
-        print(f"├─{'─'*(COL1-2)}─┴─{'─'*(COL2-2)}─┤")
-        print(f"│ {title.ljust(inner)} │")
-        print(f"├─{'─'*(COL1-2)}─┬─{'─'*(COL2-2)}─┤")
+        inner = COL1 + COL2 - 1
+        print(f"├─{'─'*(COL1-2)}─┴─{'─'*(COL2-2)}─")
+        print(f"│ {title}")
+        print(f"├─{'─'*(COL1-2)}─┬─{'─'*(COL2-2)}─")
 
     def divider():
-        print(f"├─{'─'*(COL1-2)}─┬─{'─'*(COL2-2)}─┤")
+        print(f"├─{'─'*(COL1-2)}─┬─{'─'*(COL2-2)}─")
 
     # ── top border ────────────────────────────────────────────────────────
     title = f"  MAC Address Report: {mac}"
-    print(f"┌─{'─'*(TOTAL-2)}─┐")
-    print(f"│{title:<{TOTAL}}│")
-    print(f"├─{'─'*(COL1-2)}─┬─{'─'*(COL2-2)}─┤")
+    print(f"┌─{'─'*(TOTAL-2)}─")
+    print(f"│{title}")
+    print(f"├─{'─'*(COL1-2)}─┬─{'─'*(COL2-2)}─")
 
     # ── address type & scope ──────────────────────────────────────────────
     row("Address Type",  classification["address_type"])
@@ -360,7 +381,96 @@ def print_mac_table(mac, classification, vendor):
             row("Hardware Type", "Unknown - may be a private or custom NIC")
 
     # ── bottom border ──────────────────────────────────────────────────────
-    print(f"└─{'─'*(TOTAL-2)}─┘")
+    print(f"└─{'─'*(TOTAL-2)}─")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BATCH / CSV MODE
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Ordered column definitions used by write_csv_report().
+# Each tuple is (csv_header, callable(mac, classification, vendor) -> value).
+_CSV_COLUMNS = [
+    ("Input",              lambda m, c, v: m),
+    ("Valid",              lambda m, c, v: True),
+    ("Address Type",       lambda m, c, v: c["address_type"]),
+    ("Scope",              lambda m, c, v: c["scope"]),
+    ("Multicast",          lambda m, c, v: c["is_multicast"]),
+    ("Locally Admin",      lambda m, c, v: c["is_local"]),
+    ("Broadcast",          lambda m, c, v: c["is_broadcast"]),
+    ("Virtual / LAA",      lambda m, c, v: c["virtual_hint"] or ""),
+    ("Multicast Group",    lambda m, c, v: c["multicast_hint"] or ""),
+    ("Note",               lambda m, c, v: c["note"] or ""),
+    ("Manufacturer Prefix",lambda m, c, v: ":".join(m.split(":")[:3])),
+    ("Company",            lambda m, c, v: (v["company"] if v else "")),
+    ("Registered Address", lambda m, c, v: (v["address"] if v else "")),
+    ("Country",            lambda m, c, v: (v["country"] if v else "")),
+    ("Search / Website",   lambda m, c, v: (v["website"] if v else "")),
+]
+
+# Sentinel row used when normalise_mac() rejects the input.
+# Built as a plain dict to allow mixed str/bool values (same as valid rows).
+_INVALID_ROW: dict = {h: "" for h, _ in _CSV_COLUMNS}
+_INVALID_ROW["Valid"] = False
+
+
+def write_csv_report(rows, output_path):
+    """
+    Write a list of pre-built row dicts to a CSV file.
+
+    Args:
+        rows        – list of dicts keyed by the headers in _CSV_COLUMNS
+        output_path – destination file path
+    """
+    headers = [col[0] for col in _CSV_COLUMNS]
+    with open(output_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=headers)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def batch_mode(mac_sources, output_path):
+    """
+    Process a list of MAC address strings and write results to a CSV file.
+
+    Args:
+        mac_sources – list of raw strings (may be comma-separated or one-per-item)
+        output_path – destination .csv path
+    """
+    # Normalise: split on commas, strip whitespace, skip blanks.
+    raw_tokens = []
+    for item in mac_sources:
+        raw_tokens.extend(item.split(","))
+    macs_raw = [t.strip() for t in raw_tokens if t.strip()]
+
+    if not macs_raw:
+        print("Error: no MAC addresses supplied.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Processing {len(macs_raw)} address(es)…")
+    rows = []
+    for raw in macs_raw:
+        print(f"  {raw}", end="  ", flush=True)
+        mac, error = normalise_mac(raw)
+        if error:
+            print("✗ (invalid)")
+            row = dict(_INVALID_ROW)
+            row["Input"] = raw
+            rows.append(row)
+            continue
+
+        classification = classify_mac(mac)
+        vendor = None
+        if not classification["is_broadcast"] and mac != "00:00:00:00:00:00":
+            vendor = lookup_vendor(mac)
+
+        row = {header: extractor(mac, classification, vendor)
+               for header, extractor in _CSV_COLUMNS}
+        rows.append(row)
+        print("✓")
+
+    write_csv_report(rows, output_path)
+    print(f"\nReport written to: {output_path}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -368,6 +478,80 @@ def print_mac_table(mac, classification, vendor):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
+    """
+    MAC Address Validator — interactive mode or batch CSV mode.
+
+    Batch mode (--macs or --file):
+        mac_validator.py --macs "00:50:56:C0:00:08, 00-15-5D-01-02-03" --output report.csv
+        mac_validator.py --file macs.txt --output report.csv
+
+    Interactive mode (no arguments):
+        mac_validator.py
+    """
+    parser = argparse.ArgumentParser(
+        prog="mac_validator",
+        description="MAC Address Validator — interactive or batch CSV mode.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  # Interactive mode (no arguments)\n"
+            "  mac_validator.py\n"
+            "\n"
+            "  # Comma-separated list inline\n"
+            "  mac_validator.py --macs \"00:50:56:C0:00:08, 00-15-5D-01-02-03\"\n"
+            "\n"
+            "  # One MAC per line in a text file\n"
+            "  mac_validator.py --file macs.txt\n"
+            "\n"
+            "  # Custom output path (default: mac_report.csv)\n"
+            "  mac_validator.py --macs \"52:54:00:12:34:56\" --output /tmp/results.csv\n"
+            "\n"
+            "  # Combine inline list and file into one report\n"
+            "  mac_validator.py --macs \"FF:FF:FF:FF:FF:FF\" --file extra_macs.txt --output combined.csv\n"
+            "\n"
+            "Accepted MAC formats:\n"
+            "  00:50:56:C0:00:08   (colon-separated)\n"
+            "  00-50-56-C0-00-08   (hyphen-separated)\n"
+            "  0050.56C0.0008      (Cisco dot-notation)\n"
+            "  005056C00008        (plain hex, no separator)\n"
+        ),
+        add_help=True,
+    )
+    parser.add_argument(
+        "--macs",
+        metavar="MAC_LIST",
+        help="Comma-separated list of MAC addresses to validate.",
+    )
+    parser.add_argument(
+        "--file",
+        metavar="PATH",
+        help="Path to a text file containing one MAC address per line "
+             "(or comma-separated on any line).",
+    )
+    parser.add_argument(
+        "--output",
+        metavar="CSV_PATH",
+        default="mac_report.csv",
+        help="Output CSV file path (default: mac_report.csv).",
+    )
+    args = parser.parse_args()
+
+    # ── Batch mode ────────────────────────────────────────────────────────
+    if args.macs or args.file:
+        mac_sources = []
+        if args.macs:
+            mac_sources.append(args.macs)
+        if args.file:
+            try:
+                with open(args.file, encoding="utf-8") as fh:
+                    mac_sources.extend(fh.read().splitlines())
+            except OSError as exc:
+                print(f"Error reading file: {exc}", file=sys.stderr)
+                sys.exit(1)
+        batch_mode(mac_sources, args.output)
+        return
+
+    # ── Interactive mode ──────────────────────────────────────────────────
     print("=" * 76)
     print("  MAC ADDRESS VALIDATOR")
     print("=" * 76)
@@ -381,6 +565,7 @@ def main():
     print("\nInteractive Mode (type 'quit' to exit)")
     print("Enter a MAC address in any common format:")
     print("  00:50:56:C0:00:08  |  00-50-56-C0-00-08  |  0050.56C0.0008  |  005056C00008")
+    print("You can also run this application in batch mode. use mac_validator.py --help for details")
     print("-" * 76)
 
     while True:
